@@ -16,6 +16,7 @@ require dasllama/dasllama_whisper
 require metal/das_metal_boost
 require dasllama/dasllama_metal_common
 require dasllama/dasllama_metal_lens   // release_handles
+require dasllama/dasllama_gpu_math   // the row stamps' activation codes
 require dasllama/dasllama_metal_kernels
 require dasllama/dasllama_metal_prefill   // metal_prefill_pso_init — the borrowed-builder bring-up seat
 
@@ -446,12 +447,10 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
     var u_ff = uniform_u32(uint(4l * d))
     var u_eps = uniform_f32(w.eps)
     var u_totd = uniform_u32(uint(n * d))
-    var u_totff = uniform_u32(uint(n * 4l * d))
     var u_n = uniform_u32(uint(n))
     var u_p0 = uniform_u32(uint(p0))
     var u_tmax = uniform_u32(uint(tmax))
     var u_ta = uniform_u32(uint(ta))
-    var u_hh = uniform_u32(uint(hh))
     let nch_s = (p0 + n + 255l) / 256l
     let nch_c = (ta + 255l) / 256l
     var u_c1 = uniform_u32(1u)
@@ -496,7 +495,7 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
             // mlp (fc1 bias folds into the LUT-GELU pass, fc2's into the residual add)
             enc_ln(enc, g_wd_sx, bblobf, uint64(lo.ln2_w * 4l), bblobf, uint64(lo.ln2_b * 4l), g_wd_sxb, 0ul, u_d, u_eps, n)
             wd_mm(enc, g_wd_boffs[bo + 8l], g_wd_sxb, g_wd_sh, u_d, u_ff, d, 4l * d, n)
-            enc_bias_gelu_lut(enc, g_wd_sh, 0ul, bblobf, uint64(lo.fc1_b * 4l), u_ff, u_totff, n * 4l * d)
+            tw_bias(enc, g_wd_sh, bblobf, GkBiasActArgs(d = uint(4l * d), nelem = uint(n * 4l * d), boff = uint(lo.fc1_b), act = BIAS_ACT_GELU_TANH))
             wd_mm(enc, g_wd_boffs[bo + 9l], g_wd_sh, g_wd_sxb, u_ff, u_d, 4l * d, d, n)
             enc_bias_add_res(enc, g_wd_sx, g_wd_sxb, bblobf, uint64(lo.fc2_b * 4l), u_d, u_totd, n * d)
         }
@@ -510,12 +509,10 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
     pool_release(g_upool, u_ff, 4ul)
     pool_release(g_upool, u_eps, 4ul)
     pool_release(g_upool, u_totd, 4ul)
-    pool_release(g_upool, u_totff, 4ul)
     pool_release(g_upool, u_n, 4ul)
     pool_release(g_upool, u_p0, 4ul)
     pool_release(g_upool, u_tmax, 4ul)
     pool_release(g_upool, u_ta, 4ul)
-    pool_release(g_upool, u_hh, 4ul)
     pool_release(g_upool, u_c1, 4ul)
     pool_release(g_upool, u_c0, 4ul)
     pool_release(g_upool, u_nv, 4ul)

@@ -168,8 +168,8 @@ var g_pso_geglu : MetalComputePipeline?
 var g_pso_geglu_hx : MetalComputePipeline?    // dual-store stamp
 // ===== tower primitives (compiled in the tower driver's init) =====
 var g_pso_ln : MetalComputePipeline?
-var g_pso_gelu_erf : MetalComputePipeline?
-var g_pso_gelu_lut : MetalComputePipeline?
+var g_pso_bias_act : MetalComputePipeline?   //! the bias + activation rows, the template both homes stamp
+var g_pso_act_rows : MetalComputePipeline?   //! the activation alone
 var g_pso_posadd : MetalComputePipeline?
 var g_pso_q3v_stem : MetalComputePipeline?   //!< the qwen3v stem assemble (reorder-gather + bias + pos)
 var g_pso_clamp : MetalComputePipeline?        // gemma4v: the ClippableLinear clamp
@@ -185,7 +185,6 @@ var g_pso_im2col2d : MetalComputePipeline?    // the qwen3a conv2d im2col (k=3, 
 var g_pso_wdec_attn_part : MetalComputePipeline?  // the chunked online-softmax partial
 var g_pso_wdec_attn_comb : MetalComputePipeline?  // the log-sum-exp chunk merge
 var g_pso_bias_add_res : MetalComputePipeline?   // whisper decode: bias + residual add
-var g_pso_bias_gelu_lut : MetalComputePipeline?  // whisper decode: bias + LUT-form GELU
 var g_pso_softcap : MetalComputePipeline?
 var g_pso_suppress : MetalComputePipeline?
 var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind

@@ -10158,35 +10158,6 @@ class TowerLnRq : TowerPostAddLnT {
     override OUT32 = false
 }
 
-let BIAS_ACT_NONE = 0u        //! `TowerBiasArgs.act`: the bias row alone
-let BIAS_ACT_GELU_TANH = 1u   //! ... then the tanh-LUT GELU (the vision towers, the whisper family)
-let BIAS_ACT_GELU_ERF = 2u    //! ... then the erf GELU (qwen2audio, voxtral, ultravox, the Omni audio towers, Qwen3-ASR)
-let BIAS_ACT_SILU = 3u        //! ... then silu (the FastConformer's FFN)
-let BIAS_ACT_RELU = 4u        //! ... then relu (the FastConformer's subsample stack)
-
-struct TowerBiasArgs {
-    d : uint        //! the row width, a 4-multiple
-    nelem : uint
-    boff : uint     //! the bias row's base in wn
-    act : uint
-}
-
-//! the tower activations by `TowerBiasArgs.act` code
-def tower_act(v : float; act : uint) : float {
-    if (act == BIAS_ACT_NONE) {
-        return v
-    }
-    if (act == BIAS_ACT_GELU_ERF) {
-        return gelu_erf_f32(v)
-    }
-    if (act == BIAS_ACT_SILU) {
-        return silu_f32(v)
-    }
-    if (act == BIAS_ACT_RELU) {
-        return max(v, 0.0)
-    }
-    return gelu_tanh_lut_f32(v)
-}
 
 struct TowerBiasRqArgs {
     d : uint        //! the row width, a 32-multiple
@@ -10207,60 +10178,32 @@ class TowerBiasActRq : RqT {
     def override load1(e : uint) : float => gelu_tanh_lut_f32(x[e] + wn[pa.boff + e % max(1u, pa.d)])
 }
 
-//! a GEMM output's bias row added in place, then the activation `pa.act` names (`tower_act`); a stamp overriding `biased`
-//! broadcasts the row another way (TtsPkRowScale's layer scale)
-[ |> template_struct_instance]
-class template TowerBiasActT {
-    @template_constant OUT16 : bool = false   //! the biased, activated rows stored as f16 into `outh` (the cm2 tile's feed), x read alone; else in place
-    @template_constant BIAS : bool = true     //! the bias row added ahead of the activation; false = the activation alone (the Conformer's silu rows)
-    @ssbo @binding = 0 x : array<float>
-    @ssbo @binding = 1 @role = "weight" @template_gate = BIAS wn : array<float>
-    @ssbo @binding = 2 @template_gate = OUT16 outh : array<float16>
-    @push_constant pa : TowerBiasArgs
-
-    def biased(e : uint) : float {
-        var v = x[e]
-        static_if (BIAS) {
-            v += wn[pa.boff + e % max(1u, pa.d)]
-        }
-        return tower_act(v, pa.act)
-    }
-
-    def store(e : uint; v : float) : void {
-        static_if (OUT16) {
-            outh[e] = half_sat(v)
-        } else {
-            x[e] = v
-        }
-    }
-
-    [spirv_kernel(local_size_x = 256)]
+[vk_dispatch(name = "tower_bias_act_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
+class TowerBiasAct : GkBiasAct {
+    [spirv_kernel(local_size_x = 256, name = "tower_bias_act_cls_spv")]
     def run {
-        let e = gl_GlobalInvocationID.x * 4u
-        if (e < pa.nelem) {
-            let v0 = biased(e)
-            let v1 = biased(e + 1u)
-            let v2 = biased(e + 2u)
-            let v3 = biased(e + 3u)
-            store(e, v0)
-            store(e + 1u, v1)
-            store(e + 2u, v2)
-            store(e + 3u, v3)
-        }
+        bias_act_body()
     }
 }
 
-[vk_dispatch(name = "tower_bias_act_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
-class TowerBiasAct : TowerBiasActT {}
-
 [vk_dispatch(name = "tower_bias_act_cvt16_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
-class TowerBiasActCvt16 : TowerBiasActT {
+class TowerBiasActCvt16 : GkBiasAct {
     override OUT16 = true
+
+    [spirv_kernel(local_size_x = 256, name = "tower_bias_act_cvt16_cls_spv")]
+    def run {
+        bias_act_body()
+    }
 }
 
 [vk_dispatch(name = "tower_act_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
-class TowerAct : TowerBiasActT {
+class TowerAct : GkBiasAct {
     override BIAS = false
+
+    [spirv_kernel(local_size_x = 256, name = "tower_act_cls_spv")]
+    def run {
+        bias_act_body()
+    }
 }
 
 [vk_dispatch(name = "tower_hpad_cls", kernel = "run", grid = "wgs", params = "wgs : int64"), arch(at = "../ARCHITECTURE_GPU_TOWER_VULKAN.md#vk-tower-routes")]
@@ -13380,8 +13323,13 @@ class TtsPkRowsElu : GkPkRows {
 //! x [rows][d] *= the scale row at boff in place - a transformer layer's per-channel layer scale (the CPU
 //! `layer_scale_rows`) on the bias stamp's row-broadcast shell: four elements an invocation, d a 4-multiple, `act` unread
 [vk_dispatch(name = "tts_pk_row_scale_cls", kernel = "run", grid = "nelem/1024", params = "nelem : int64")]
-class TtsPkRowScale : TowerBiasActT {
-    def override biased(e : uint) : float => x[e] * wn[pa.boff + e % max(1u, pa.d)]
+class TtsPkRowScale : GkBiasAct {
+    override SCALE = true
+
+    [spirv_kernel(local_size_x = 256, name = "tts_pk_row_scale_cls_spv")]
+    def run {
+        bias_act_body()
+    }
 }
 
 let TTS_PK_ATTN_HS = GK_PK_ATTN_HS

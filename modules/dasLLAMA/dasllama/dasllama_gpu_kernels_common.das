@@ -1477,3 +1477,65 @@ class template GkIm2col2d {
         }
     }
 }
+
+struct GkBiasActArgs {
+    d : uint        //! the row width, a 4-multiple
+    nelem : uint
+    boff : uint     //! the bias row's base in wn
+    act : uint
+    xoff : uint     //! the rows' base in x (a Metal site inside a larger buffer; 0 elsewhere)
+}
+
+//! a GEMM output's bias row added in place, then the activation `pa.act` names (`tower_act`); a stamp overriding `biased`
+//! broadcasts the row another way (TtsPkRowScale's layer scale)
+[ |> template_struct_instance]
+class template GkBiasAct {
+    @template_constant OUT16 : bool = false   //! the biased, activated rows stored as f16 into `outh` (the cm2 tile's feed), x read alone; else in place
+    @template_constant BIAS : bool = true     //! the bias row added ahead of the activation; false = the activation alone (the Conformer's silu rows)
+    @template_constant SCALE : bool = false   //! the row at `boff` multiplies the rows instead (a layer scale), no activation; BIAS stays true for the binding
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>
+    @ssbo @binding = 1 @role = "weight" @template_gate = BIAS wn : array<float>
+    @ssbo @binding = 2 @role = "write" @template_gate = OUT16 outh : array<float16>
+    @kargs pa : GkBiasActArgs
+
+    def store(e : uint; v : float) : void {
+        static_if (OUT16) {
+            outh[e] = half_sat(v)
+        } else {
+            x[pa.xoff + e] = v
+        }
+    }
+
+    def bias_act_body {
+        let e = gl_GlobalInvocationID.x * 4u
+        if (e < pa.nelem) {
+            let c = e % max(1u, pa.d)
+            var v0 = x[pa.xoff + e]
+            var v1 = x[pa.xoff + e + 1u]
+            var v2 = x[pa.xoff + e + 2u]
+            var v3 = x[pa.xoff + e + 3u]
+            static_if (SCALE) {
+                v0 *= wn[pa.boff + c]
+                v1 *= wn[pa.boff + c + 1u]
+                v2 *= wn[pa.boff + c + 2u]
+                v3 *= wn[pa.boff + c + 3u]
+            } else {
+                static_if (BIAS) {
+                    v0 += wn[pa.boff + c]
+                    v1 += wn[pa.boff + c + 1u]
+                    v2 += wn[pa.boff + c + 2u]
+                    v3 += wn[pa.boff + c + 3u]
+                }
+                v0 = act_f32(v0, pa.act)
+                v1 = act_f32(v1, pa.act)
+                v2 = act_f32(v2, pa.act)
+                v3 = act_f32(v3, pa.act)
+            }
+            store(e, v0)
+            store(e + 1u, v1)
+            store(e + 2u, v2)
+            store(e + 3u, v3)
+        }
+    }
+}
+

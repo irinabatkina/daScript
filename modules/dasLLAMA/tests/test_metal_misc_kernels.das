@@ -20,6 +20,7 @@ require daslib/f16_cvt              // f32_to_f16 — packing the synthetic scal
 require math
 require strings
 require daslib/strings_boost
+require dasllama/dasllama_gpu_math   // nolint:STYLE030,LINT019 - the row stamps' activation codes, inside the device arms
 
 // The decode-side elementwise/misc corpus vs direct CPU oracles on synthetic data: copy_row,
 // argmax (the CPU sampler's exact lowest-index tie-break, exercised with deliberate exact
@@ -616,7 +617,7 @@ def private gelu_flavor_gate(t : T?; var dev, queue; total : int; lut : bool) {
     let tag = "gelu_{lut ? "lut" : "erf"} total={total}"
     with_metal_cell(dev, queue) $(var mc : MetalCell) {
         var err : string
-        let st = lut ? stamp_of(@@enc_gelu_lut) : stamp_of(@@enc_gelu_erf)
+        let st = stamp_of(@@enc_act_rows)
         var pso = mc |> keep_stamp(st, err)
         return if (!pso_ok(t, tag, pso, err))
         var inscope g : array<float>
@@ -640,15 +641,15 @@ def private gelu_flavor_gate(t : T?; var dev, queue; total : int; lut : bool) {
             gelu_erf(want, int64(total))
         }
         let bg = mc |> io_(g)
-        let btot = mc |> in_plain([uint(total)])
+        var ka = GkBiasActArgs(d = 0u, nelem = uint(total), boff = 0u, act = lut ? BIAS_ACT_GELU_TANH : BIAS_ACT_GELU_ERF)
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
             stamp_run(st, pso) {
-                invoke(st.enc, enc, mc.buf[bg], 0ul, mc.buf[btot], int64(total))
+                invoke(st.enc, enc, mc.buf[bg], ka, int64((total + 3) / 4))
             }
         }
         return if (!ran || total < 8)
         // LUT: one f16 ulp at |g|~10 (RNE tie flips between the tanh and exp-identity evals);
-        // erf: two ~1.5e-7-accurate erf approximations (NR double vs A&S f32) plus f32 eval noise
+        // erf: the CPU's double-precision NR erfc against the same form in f32
         check_buf(t, "{tag}: form-matched inside the flavor bar", mc.buf[bg], want, Bar(abs_floor = lut ? 1e-2 : 1e-5), FLAT_SHAPE)
         var inscope back <- mc |> plane_run(bg)
         t |> success(back[total - 1] == 50.0 && back[total - 3] == 100.0, "{tag}: positive saturation exact")
@@ -1043,7 +1044,7 @@ def private bias_rows_gate(t : T?; var dev, queue; nrows, dim : int; gelu : bool
     let tag = "bias_{gelu ? "gelu_lut" : "add_res"} nrows={nrows} dim={dim}"
     with_metal_cell(dev, queue) $(var mc : MetalCell) {
         var err : string
-        let sg = stamp_of(@@enc_bias_gelu_lut)
+        let sg = stamp_of(@@enc_bias_act)
         let sr = stamp_of(@@enc_bias_add_res)
         var pso = gelu ? (mc |> keep_stamp(sg, err)) : (mc |> keep_stamp(sr, err))
         return if (!pso_ok(t, tag, pso, err))
@@ -1074,10 +1075,11 @@ def private bias_rows_gate(t : T?; var dev, queue; nrows, dim : int; gelu : bool
         let bb = mc |> in_(b)
         let bdim = mc |> in_plain([uint(dim)])
         let btot = mc |> in_plain([uint(total)])
+        var ka = GkBiasActArgs(d = uint(dim), nelem = uint(total), boff = 0u, act = BIAS_ACT_GELU_TANH)
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
             if (gelu) {
                 stamp_run(sg, pso) {
-                    invoke(sg.enc, enc, mc.buf[bx], 0ul, mc.buf[bb], 0ul, mc.buf[bdim], mc.buf[btot], int64(total))
+                    invoke(sg.enc, enc, mc.buf[bx], mc.buf[bb], ka, int64((total + 3) / 4))
                 }
             } else {
                 stamp_run(sr, pso) {

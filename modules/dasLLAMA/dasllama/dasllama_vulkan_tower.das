@@ -26,6 +26,7 @@ require dasllama/dasllama_canary
 require dasllama/dasllama_parakeet
 require dasllama/dasllama_qwen3a
 require dasllama/dasllama_convert
+require dasllama/dasllama_gpu_math   // the row stamps' activation codes
 
 //! The tower Vulkan driver (the vision and audio encoders): one-shot encoder chains - no session, no KV, no mirror - that
 //! serve a family's block loop dispatch for dispatch as the family's CPU loop spells it, over the
@@ -1290,8 +1291,8 @@ def private vulkan_gemma4a_blocks(t : Gemma4aEncoder; var s : Gemma4aState; npos
     var pc_rel = BatchArgs(n = uint(d), d = uint(d), map_off = 0u)
     var pc_glu = GkGatedRowsArgs(d = uint(d), nelem = uint(nd))
     var pc_dw = GkDwConvRowsArgs(c = uint(d), t_in = uint(npos))
-    var pc_silu_ff = TowerBiasArgs(d = uint(ff), nelem = uint(nff), boff = 0u, act = BIAS_ACT_SILU)
-    var pc_silu_d = TowerBiasArgs(d = uint(d), nelem = uint(nd), boff = 0u, act = BIAS_ACT_SILU)
+    var pc_silu_ff = GkBiasActArgs(d = uint(ff), nelem = uint(nff), boff = 0u, act = BIAS_ACT_SILU)
+    var pc_silu_d = GkBiasActArgs(d = uint(d), nelem = uint(nd), boff = 0u, act = BIAS_ACT_SILU)
     let sc = gk_g4a_attn_scales(hs)
     var pc_attn = GkG4aAttnArgs(d = uint(d), npos = uint(npos), hs = uint(hs), pdsoff = 0u, cap = GK_G4A_ATTN_CAP, qscale = sc.qscale, kscale = sc.kscale)
     var pc_rms = tower_rms_args(uint(d), 0u, t.eps)
@@ -1476,7 +1477,7 @@ def private vt_fc_bias(raw : VkCommandBuffer; var h : VkHaz; biased : bool; var 
     if (biased) {
         vt_bias_act(raw, h, s_bias, dout, nout, boff, act)
     } elif (act != BIAS_ACT_NONE) {
-        var pc = TowerBiasArgs(d = uint(dout), nelem = uint(nout), boff = 0u, act = act)
+        var pc = GkBiasActArgs(d = uint(dout), nelem = uint(nout), boff = 0u, act = act)
         enc_tower_act_cls(raw, h, s_act, pc, rq_wgs(false, nout))
     }
 }
@@ -1626,7 +1627,7 @@ def private vt_zero_elems(raw : VkCommandBuffer; var h : VkHaz; dev : uint64; bi
 
 //! the row-broadcast bias (and `act`) over `nout` elements of rows `dout` wide, the bias row at `boff` of the set's second binding
 def vt_bias_act(raw : VkCommandBuffer; var h : VkHaz; var s_bias : VkDescriptorSet; dout, nout, boff : int64; act : uint) {
-    var pc_b = TowerBiasArgs(d = uint(dout), nelem = uint(nout), boff = uint(boff), act = act)
+    var pc_b = GkBiasActArgs(d = uint(dout), nelem = uint(nout), boff = uint(boff), act = act)
     enc_tower_bias_act_cls(raw, h, s_bias, pc_b, rq_wgs(false, nout))
 }
 
@@ -2248,8 +2249,8 @@ def private vt_ln_chain(var r : VtResident; offs : array<LayerOffs>; k_bias : bo
     var pc_gff = BatchArgs(n = uint(d), d = uint(ff), map_off = 0u)
     var pc_dn = BatchArgs(n = uint(ff), d = uint(d), map_off = 0u, ksplit = uint(sk.ksplit))
     let nd_fc2 = vt_tile_rows(tile_fc2, npos) * d
-    var pc_bias = TowerBiasArgs(d = uint(d), nelem = uint(nd), boff = 0u, act = BIAS_ACT_NONE)
-    var pc_gelu = TowerBiasArgs(d = uint(ff), nelem = uint(nff), boff = 0u, act = fc1_act)
+    var pc_bias = GkBiasActArgs(d = uint(d), nelem = uint(nd), boff = 0u, act = BIAS_ACT_NONE)
+    var pc_gelu = GkBiasActArgs(d = uint(ff), nelem = uint(nff), boff = 0u, act = fc1_act)
     vt_chain_one_shot("whisper-class", nl, npos) $(raw : VkCommandBuffer; var h : VkHaz) {
         for (l in range64(nl)) {
             let o = offs[l]
@@ -2654,7 +2655,7 @@ def private vt_ct_enc(raw : VkCommandBuffer; var h : VkHaz; var r : VtResident; 
     vt_pt(raw, VtProfRole.gemm_o)
     let nh = tl.rows * tl.n1out
     if (tl.m2in == 0l) {
-        var pc_b = TowerBiasArgs(d = uint(tl.n1out), nelem = uint(nh), boff = tl.proj_b, act = BIAS_ACT_NONE)
+        var pc_b = GkBiasActArgs(d = uint(tl.n1out), nelem = uint(nh), boff = tl.proj_b, act = BIAS_ACT_NONE)
         enc_tower_bias_act_cls(raw, h, r.s_ct_bias_out, pc_b, rq_wgs(false, nh))
         vt_pt(raw, VtProfRole.bias)
         return
@@ -2669,7 +2670,7 @@ def private vt_ct_enc(raw : VkCommandBuffer; var h : VkHaz; var r : VtResident; 
         vt_pt(raw, VtProfRole.rms)
         vt_ct_feed(raw, h, cm2, r.s_ct_feed_gate, n2)
     } else {
-        var pc_act = TowerBiasArgs(d = uint(tl.n1out), nelem = uint(nh), boff = 0u, act = BIAS_ACT_GELU_ERF)
+        var pc_act = GkBiasActArgs(d = uint(tl.n1out), nelem = uint(nh), boff = 0u, act = BIAS_ACT_GELU_ERF)
         enc_tower_act_cls(raw, h, r.s_ct_gelu, pc_act, rq_wgs(false, nh))
         vt_pt(raw, VtProfRole.bias)
         vt_ct_feed(raw, h, cm2, r.s_ct_feed_hid, n2)
@@ -3087,8 +3088,8 @@ def private vulkan_qwen3v_blocks(t : Qwen3vTower; var s : Qwen3vState; npos : in
     var pc_gd = BatchArgs(n = uint(d), d = uint(d), map_off = 0u)
     var pc_gff = BatchArgs(n = uint(d), d = uint(ff), map_off = 0u)
     var pc_dn = BatchArgs(n = uint(ff), d = uint(d), map_off = 0u)
-    var pc_bqkv = TowerBiasArgs(d = uint(3l * d), nelem = uint(3l * nd), boff = 0u, act = BIAS_ACT_NONE)
-    var pc_gelu = TowerBiasArgs(d = uint(ff), nelem = uint(nff), boff = 0u, act = BIAS_ACT_GELU_TANH)
+    var pc_bqkv = GkBiasActArgs(d = uint(3l * d), nelem = uint(3l * nd), boff = 0u, act = BIAS_ACT_NONE)
+    var pc_gelu = GkBiasActArgs(d = uint(ff), nelem = uint(nff), boff = 0u, act = BIAS_ACT_GELU_TANH)
     cmd_one_shot() $(raw : VkCommandBuffer; var h : VkHaz) {
         for (l in range64(t.n_layer)) {
             let o = qwen3v_block_offs(t, l)
@@ -3229,7 +3230,7 @@ def private vulkan_qwen25v_blocks(t : Qwen25vTower; var s : Qwen25vState; npos :
     var pc_gd = F16GemmArgs(n = uint(d), d = uint(d), rows = uint(npos), woff = 0u, ybase = 0u, ystride = uint(d), ksplit = 0u)
     var pc_gff = F16GemmArgs(n = uint(d), d = uint(ff), rows = uint(npos), woff = 0u, ybase = 0u, ystride = uint(ff), ksplit = 0u)
     var pc_dn = F16GemmArgs(n = uint(ff), d = uint(d), rows = uint(npos), woff = 0u, ybase = 0u, ystride = uint(d), ksplit = 0u)
-    var pc_bias = TowerBiasArgs(d = uint(d), nelem = uint(nd), boff = 0u, act = BIAS_ACT_NONE)
+    var pc_bias = GkBiasActArgs(d = uint(d), nelem = uint(nd), boff = 0u, act = BIAS_ACT_NONE)
     var pc_glu = ActArgs(nelem = uint(nff), act = ACT_SILU, brow = uint(ff))
     var pc_win = TowerWinArgs(nheads = uint(t.n_head), scale = scale)
     cmd_one_shot() $(raw : VkCommandBuffer; var h : VkHaz) {
@@ -3919,7 +3920,15 @@ def private vt_cn_front_slab(var r : VtResident; fc : VtFc) : bool {
     let total = nch * kdp0
     var slab : array<float>
     slab |> reserve_resize(total)
-    tower_stage_f32_pad_row_stride(slab, fc.blob, fc.c0_w, 0l, nch, 9l, kdp0)
+    if (fc.tap_major) {   //! parakeet's conv0 taps sit [9][ch] in its blob: the slab's rows gather them a channel at a time
+        for (o in range64(nch)) {
+            for (k in range64(9l)) {
+                slab[o * kdp0 + k] = fc.blob[fc.c0_w + k * nch + o]
+            }
+        }
+    } else {
+        tower_stage_f32_pad_row_stride(slab, fc.blob, fc.c0_w, 0l, nch, 9l, kdp0)
+    }
     return vt_front_upload(r, slab, fc.twiddles, fc.device_mel ? fc.n_fft * 2l * fc.n_fb * 4l : 0l, fc.filters, fc.n_mel * fc.n_fb * 4l)
 }
 

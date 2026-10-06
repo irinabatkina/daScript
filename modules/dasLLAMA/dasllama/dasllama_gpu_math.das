@@ -231,3 +231,27 @@ def tts_div(a, b : float) : float {
 
 //! `v` stored as a half, saturated at the half's largest finite magnitude instead of overflowing to infinity
 def half_sat(v : float) : float16 => float16(clamp(v, -65504.0, 65504.0))
+
+let BIAS_ACT_NONE = 0u        //! `GkBiasActArgs.act`: the bias row alone
+let BIAS_ACT_GELU_TANH = 1u   //! ... then the tanh-LUT GELU (the vision towers, the whisper family)
+let BIAS_ACT_GELU_ERF = 2u    //! ... then the erf GELU (qwen2audio, voxtral, ultravox, the Omni audio towers, Qwen3-ASR)
+let BIAS_ACT_SILU = 3u        //! ... then silu (the FastConformer's FFN)
+let BIAS_ACT_RELU = 4u        //! ... then relu (the FastConformer's subsample stack)
+
+//! the tower activations by `GkBiasActArgs.act` code - the row stamps' ladder, one free function so either emitter inlines it; the codes
+//! are spelled as their literals (the Metal lens admits no global in a kernel): 0 none, 1 the tanh-LUT GELU, 2 the erf GELU, 3 silu, 4 relu
+def act_f32(v : float; act : uint) : float {
+    if (act == 0u) {
+        return v
+    }
+    if (act == 2u) {
+        return gelu_erf_f32(v)
+    }
+    if (act == 3u) {
+        return silu_f32(v)
+    }
+    if (act == 4u) {
+        return max(v, 0.0)
+    }
+    return gelu_tanh_lut_f32(v)
+}

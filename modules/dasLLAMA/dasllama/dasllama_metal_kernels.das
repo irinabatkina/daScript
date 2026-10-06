@@ -3628,8 +3628,8 @@ def metal_decode_init : bool {   // nolint:STYLE038 — a flat compile_pso per k
     g_pso_geglu_hx = compile_stamp(MetalGegluHX_metal_ew2_msl, ok)
     g_pso_ln = compile_stamp(metal_layernorm_msl, ok)
     g_pso_f32mm = compile_stamp(metal_f32_mulmm_msl, ok)
-    g_pso_gelu_erf = compile_stamp(MetalGeluErf_metal_ew1_msl, ok)
-    g_pso_gelu_lut = compile_stamp(MetalGeluLut_metal_ew1_msl, ok)
+    g_pso_bias_act = compile_stamp(metal_bias_act_msl, ok)
+    g_pso_act_rows = compile_stamp(metal_act_rows_msl, ok)
     g_pso_posadd = compile_stamp(metal_posadd2d_msl, ok)
     g_pso_q3v_stem = compile_stamp(metal_q3v_stem_msl, ok)
     g_pso_clamp = compile_stamp(metal_clamp_msl, ok)
@@ -3644,7 +3644,6 @@ def metal_decode_init : bool {   // nolint:STYLE038 — a flat compile_pso per k
     g_pso_wdec_attn_part = compile_stamp(metal_wdec_attn_part_msl, ok)
     g_pso_wdec_attn_comb = compile_stamp(metal_wdec_attn_comb_msl, ok)
     g_pso_bias_add_res = compile_stamp(metal_bias_add_res_msl, ok)
-    g_pso_bias_gelu_lut = compile_stamp(metal_bias_gelu_lut_msl, ok)
     g_pso_softcap = compile_stamp(metal_softcap_row_msl, ok)
     g_pso_suppress = compile_stamp(metal_suppress_row_msl, ok)
     g_pso_attn16 = compile_stamp(MetalSqAttnF16_metal_sq_attn_msl, ok)
@@ -4673,9 +4672,9 @@ def metal_kernels_release {
     release_handles(g_pso_kq_mm_b40, g_pso_kq_k2, g_pso_kq_mvb2_k2, g_pso_kq_mvb4_k2, g_pso_kq_mvb8_k2, g_pso_kq_mm_b2)
     release_handles(g_pso_rms, g_pso_rms_hx, g_pso_dn_ba, g_pso_moe_router_b, g_pso_add, g_pso_addrms_hx)
     release_handles(g_pso_addrms, g_pso_preaddrms, g_one, g_zero, g_pso_geglu, g_pso_geglu_hx)
-    release_handles(g_pso_ln, g_pso_gelu_erf, g_pso_gelu_lut, g_pso_posadd, g_pso_q3v_stem, g_pso_clamp)
+    release_handles(g_pso_ln, g_pso_bias_act, g_pso_act_rows, g_pso_posadd, g_pso_q3v_stem, g_pso_clamp)
     release_handles(g_pso_rope2d, g_pso_head_pad, g_pso_head_unpad, g_pso_geglu_quick, g_pso_cross_kx, g_pso_cross_vx, g_pso_cross_vx_h)
-    release_handles(g_pso_im2col2d, g_pso_wdec_attn_part, g_pso_wdec_attn_comb, g_pso_bias_add_res, g_pso_bias_gelu_lut)
+    release_handles(g_pso_im2col2d, g_pso_wdec_attn_part, g_pso_wdec_attn_comb, g_pso_bias_add_res)
     release_handles(g_pso_f32mm, g_pso_softcap, g_pso_suppress, g_pso_swiglu, g_pso_swiglu_hx, g_pso_swiglu_hxb)
     release_handles(g_pso_swiglu_b, g_pso_geglu_hxb, g_pso_geglu_b, g_pso_attn16, g_pso_attn32, g_pso_attnp16)
     release_handles(g_pso_attnp32, g_pso_attn_q8, g_pso_attnp_q8, g_pso_rpst_q8, g_pso_attn_tq4, g_pso_attnp_tq4)
@@ -5114,23 +5113,35 @@ class template MetalEw1T : MetalEw1BaseT {
     }
 }
 
-// The tower GELUs are FORM-MATCHED per model, never substituted — a ~1e-3/element form delta
-// amplifies coherently through a 32-layer residual stream into ~4e-2 rel_l2 (measured). The forms
-// live in dasllama_gpu_math, the CPU's own in f32, and both homes evaluate them.
-[never_inline]   // the auto-inliner would fold this back into `map`, breaking its value-position splice (single-return rule)
-def private msl_gelu_erf_form(a : float) : float => gelu_erf_f32(a)
-
-[metal_dispatch(name = "enc_gelu_erf", pso = "g_pso_gelu_erf", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalGeluErf : MetalEw1T {
-    def override map(a : float) : float => msl_gelu_erf_form(a)
+//! a GEMM output's bias row and activation, the rows template both homes stamp: four elements a thread, `total` = the
+//! element count over four (`tw_bias` / `tw_act` size the grid)
+[metal_dispatch(name = "enc_bias_act", pso = "g_pso_bias_act", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalBiasAct : GkBiasAct {
+    [metal_kernel(name = "metal_bias_act_msl")]
+    def metal_bias_act {
+        bias_act_body()
+    }
 }
 
-[never_inline]   // same single-return-splice protection as msl_gelu_erf_form
-def private msl_gelu_lut_form(a : float) : float => gelu_tanh_lut_f32(a)
+//! the activation alone over the rows (the GELUs, silu), the same template with its bias row gated off
+[metal_dispatch(name = "enc_act_rows", pso = "g_pso_act_rows", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalActRows : GkBiasAct {
+    override BIAS = false
 
-[metal_dispatch(name = "enc_gelu_lut", pso = "g_pso_gelu_lut", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalGeluLut : MetalEw1T {
-    def override map(a : float) : float => msl_gelu_lut_form(a)
+    [metal_kernel(name = "metal_act_rows_msl")]
+    def metal_act_rows {
+        bias_act_body()
+    }
+}
+
+//! the bias row at `a.boff` of `bw` added to the rows at `a.xoff` of `bx`, then `a.act`, over `a.nelem` elements
+def tw_bias(enc : MetalComputeEncoder?; bx, bw : MetalBuffer?; var a : GkBiasActArgs) {
+    enc_bias_act(enc, bx, bw, a, (int64(a.nelem) + 3l) / 4l)
+}
+
+//! `a.act` alone over the rows at `a.xoff` of `bx`
+def tw_act(enc : MetalComputeEncoder?; bx : MetalBuffer?; var a : GkBiasActArgs) {
+    enc_act_rows(enc, bx, a, (int64(a.nelem) + 3l) / 4l)
 }
 
 // The gemma4uv 2-axis position add: row p gains its x-table row (p % ncols) and its y-table
@@ -5374,38 +5385,6 @@ class MetalBiasAddRes {
         x[gid] += y[gid] + b[gid % dim]
     }
 }
-
-//! x [rows x n] = combine(x, v[i % n]) in place, one thread per element - the per-row broadcast of a vector:
-//! the bias add, the bias and the LUT-form GELU, the channel scale. The leaves carry their own entry names.
-[ |> template_struct_instance]
-class template MetalRowMapT {
-    @ssbo @binding = 0 @role = "readwrite" @off = "off" @span = "total*4" x : array<float>   //!< [rows x n], bound at the panel offset
-    @ssbo @binding = 1 @role = "weight" @off = "voff" v : array<float>     //!< [n]
-    @uniform @binding = 2 n : uint
-    @uniform @binding = 3 total : uint      //!< rows * n - grid guard
-
-    def abstract combine(a, b : float) : float
-
-    def row_map_body {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        x[gid] = combine(x[gid], v[gid % n])
-    }
-}
-
-// bias + the LUT-form GELU in one pass (the form-matched flavor — never substitute forms)
-[metal_dispatch(name = "enc_bias_gelu_lut", pso = "g_pso_bias_gelu_lut", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalBiasGeluLut : MetalRowMapT {
-    def override combine(a, b : float) : float => msl_gelu_lut_form(a + b)
-
-    [metal_kernel(name="metal_bias_gelu_lut_msl")]
-    def metal_bias_gelu_lut {
-        row_map_body()
-    }
-}
-
 
 //! One chunk of a rows conv: output rows [r0, r0 + rows) padded to mp, kdim = k * cin padded to 32; xs the input rows' stride (cin, or the producer's padded width).
 struct St2ConvArgs {
@@ -10972,14 +10951,14 @@ class MetalPkRowsElu : GkPkRows {
     }
 }
 
-//! x [t][c] *= s[c]: a transformer layer's per-channel layer scale.
+//! x [t][c] *= s[c]: a transformer layer's per-channel layer scale, the rows template's SCALE stamp (`total` = the elements over four)
 [metal_dispatch(name = "enc_pk_row_scale", pso = "g_pso_pk_row_scale", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalPkRowScale : MetalRowMapT {
-    def override combine(a, b : float) : float => a * b
+class MetalPkRowScale : GkBiasAct {
+    override SCALE = true
 
-    [metal_kernel(name="metal_pk_row_scale_msl")]
+    [metal_kernel(name = "metal_pk_row_scale_msl")]
     def metal_pk_row_scale {
-        row_map_body()
+        bias_act_body()
     }
 }
 

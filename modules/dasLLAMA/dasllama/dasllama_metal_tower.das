@@ -35,6 +35,7 @@ require daslib/math_bits
 require dasllama/dasllama_tower   // Clamp — the calibration record the gemma4a sites carry
 require metal/das_metal_boost
 require dasllama/dasllama_metal_common
+require dasllama/dasllama_gpu_math   // the row stamps' activation codes
 require dasllama/dasllama_metal_kernels
 require dasllama/dasllama_metal_prefill   // pf_enc_bf16_mm + the attention trio — the crowned builders
 
@@ -192,7 +193,7 @@ def private metal_gemma4uv_encode(t : Gemma4uvEmbedder; var s : Gemma4uvState; n
         } else {
             enc_f32_mm(enc, bblob, uint64(t.patch_w * 4l), bx0, bx1, 0ul, u_pdim, u_d, mp, d)
         }
-        enc_add_bias_rows(enc, bx1, 0ul, bblob, uint64(t.patch_b * 4l), u_d, u_tot, npos * d)
+        tw_bias(enc, bx1, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(t.patch_b), act = BIAS_ACT_NONE))
         enc_ln(enc, bx1, bblob, uint64(t.ln2_w * 4l), bblob, uint64(t.ln2_b * 4l), bx1, 0ul, u_d, u_eps, npos)
         enc_posadd2d(enc, bx1, bblob, uint64(t.pos_w * 4l), u_d, u_ncols, u_pe, u_tot, npos * d)
         enc_ln(enc, bx1, bblob, uint64(t.ln3_w * 4l), bblob, uint64(t.ln3_b * 4l), bx1, 0ul, u_d, u_eps, npos)
@@ -422,10 +423,10 @@ def private tw_tail_body(enc : MetalComputeEncoder?; t : AudioTower; tl : TwTail
     enc_ln(enc, bs, bblob, uint64(t.lnp_w_off * 4l), bblob, uint64(t.lnp_b_off * 4l), tl.bin, 0ul, u_d, u_eps, tp)
     if (t.proj_kind == AudioProjKind.qwen2a) {
         enc_f32_mm(enc, bblob, uint64(t.proj_w_off * 4l), tl.bin, tl.bout, 0ul, tl.u_in, tl.u_proj, tl.mpr, t.proj_dim)
-        enc_add_bias_rows(enc, tl.bout, 0ul, bblob, uint64(t.proj_b_off * 4l), tl.u_proj, tl.u_tot, rows * t.proj_dim)
+        tw_bias(enc, tl.bout, bblob, GkBiasActArgs(d = uint(t.proj_dim), nelem = uint(rows * t.proj_dim), boff = uint(t.proj_b_off), act = BIAS_ACT_NONE))
     } else {   // voxtral: the stacked rows through the GELU MLP
         enc_f32_mm(enc, bblob, uint64(t.proj_w_off * 4l), tl.bin, tl.bhid, 0ul, tl.u_in, tl.u_hid, tl.mpr, t.mm1_out)
-        enc_gelu_erf(enc, tl.bhid, 0ul, tl.u_tot, rows * t.mm1_out)
+        tw_act(enc, tl.bhid, GkBiasActArgs(d = uint(0), nelem = uint(rows * t.mm1_out), boff = 0u, act = BIAS_ACT_GELU_ERF))
         enc_f32_mm(enc, bblob, uint64(t.mm2_w_off * 4l), tl.bhid, tl.bout, 0ul, tl.u_hid, tl.u_proj, tl.mpr, t.proj_dim)
     }
 }
@@ -514,29 +515,24 @@ def private metal_tower_blocks_form(t : AudioTower; var s : EncoderState; npos :
             let lo = enc_layer_offsets(t, l)
             enc_ln(enc, bx, bblob, uint64(lo.ln1_w * 4l), bblob, uint64(lo.ln1_b * 4l), bxb, 0ul, u_d, u_eps, npos)
             wt_mm(enc, t.q8, l * TW_Q8_MATS, f16w, bf16w, bwh, bblob, lo.q_w, bxb, bxh, bq, u_d, u_d, mp, d, d, true)
-            enc_add_bias_rows(enc, bq, 0ul, bblob, uint64(lo.q_b * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bq, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(lo.q_b), act = BIAS_ACT_NONE))
             wt_mm(enc, t.q8, l * TW_Q8_MATS + 1l, f16w, bf16w, bwh, bblob, lo.k_w, bxb, bxh, bk, u_d, u_d, mp, d, d, false)
             if (t.has_k_bias) {
-                enc_add_bias_rows(enc, bk, 0ul, bblob, uint64(lo.k_b * 4l), u_d, u_totd, npos * d)
+                tw_bias(enc, bk, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(lo.k_b), act = BIAS_ACT_NONE))
             }
             wt_mm(enc, t.q8, l * TW_Q8_MATS + 2l, f16w, bf16w, bwh, bblob, lo.v_w, bxb, bxh, bv, u_d, u_d, mp, d, d, false)
-            enc_add_bias_rows(enc, bv, 0ul, bblob, uint64(lo.v_b * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bv, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(lo.v_b), act = BIAS_ACT_NONE))
             enc_qk_mm(enc, bq, bk, batt, ka, mp, nk64, t.n_head)
             enc_rowstat(enc, batt, ka, bstat, null, npos, t.n_head)
             enc_av_mm(enc, batt, bv, bxb2, ka, bstat, mp, t.n_head, hs)
             wt_mm(enc, t.q8, l * TW_Q8_MATS + 3l, f16w, bf16w, bwh, bblob, lo.o_w, bxb2, bxh, bxb, u_d, u_d, mp, d, d, true)
-            enc_add_bias_rows(enc, bxb, 0ul, bblob, uint64(lo.o_b * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bxb, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(lo.o_b), act = BIAS_ACT_NONE))
             enc_add(enc, bx, 0ul, bxb, 0ul, u_totd, npos * d)
             enc_ln(enc, bx, bblob, uint64(lo.ln2_w * 4l), bblob, uint64(lo.ln2_b * 4l), bxb, 0ul, u_d, u_eps, npos)
             wt_mm(enc, t.q8, l * TW_Q8_MATS + 4l, f16w, bf16w, bwh, bblob, lo.fc1_w, bxb, bxh, bh, u_d, u_ff, mp, ff, d, true)
-            enc_add_bias_rows(enc, bh, 0ul, bblob, uint64(lo.fc1_b * 4l), u_ff, u_totff, npos * ff)
-            if (t.gelu_tanh) {
-                enc_gelu_lut(enc, bh, 0ul, u_totff, npos * ff)
-            } else {
-                enc_gelu_erf(enc, bh, 0ul, u_totff, npos * ff)
-            }
+            tw_bias(enc, bh, bblob, GkBiasActArgs(d = uint(ff), nelem = uint(npos * ff), boff = uint(lo.fc1_b), act = t.gelu_tanh ? BIAS_ACT_GELU_TANH : BIAS_ACT_GELU_ERF))
             wt_mm(enc, t.q8, l * TW_Q8_MATS + 5l, f16w, bf16w, bwh, bblob, lo.fc2_w, bh, bxh, bxb2, u_ff, u_d, mp, d, ff, true)
-            enc_add_bias_rows(enc, bxb2, 0ul, bblob, uint64(lo.fc2_b * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bxb2, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(lo.fc2_b), act = BIAS_ACT_NONE))
             enc_add(enc, bx, 0ul, bxb2, 0ul, u_totd, npos * d)
         }
         if (form == TwForm.ln_post) {
@@ -765,7 +761,7 @@ def private g4a_tail_make(t : Gemma4aEncoder; c : G4aGpuCtx) : G4aTail {
 def private g4a_tail_body(enc : MetalComputeEncoder?; t : Gemma4aEncoder; c : G4aGpuCtx; tl : G4aTail) {
     let mid = gemma4a_mid_dim(t)
     enc_f32_mm(enc, c.bblob, uint64(t.outproj_w * 4l), c.bx, tl.btmp, 0ul, c.u_d, tl.u_mid, c.mp, mid)
-    enc_add_bias_rows(enc, tl.btmp, 0ul, c.bblob, uint64(t.outproj_b * 4l), tl.u_mid, tl.u_totmid, c.npos * mid)
+    tw_bias(enc, tl.btmp, c.bblob, GkBiasActArgs(d = uint(mid), nelem = uint(c.npos * mid), boff = uint(t.outproj_b), act = BIAS_ACT_NONE))
     pf_enc_rms(enc, tl.btmp, 0ul, g_tw_ones, tl.btmp, tl.u_mid, c.u_eps, c.npos)
     enc_f32_mm(enc, c.bblob, uint64(t.mmproj_w * 4l), tl.btmp, tl.bout, 0ul, tl.u_mid, tl.u_proj, c.mp, t.proj_dim)
 }
@@ -810,7 +806,7 @@ def private g4a_blocks_body(enc : MetalComputeEncoder?; t : Gemma4aEncoder; c : 
         ka.pdsoff = uint(lo.per_dim_scale)
         pf_enc_rms(enc, c.bx, 0ul, bw_ffn, c.bxb, c.u_d, c.u_eps, npos)
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_ff_up, rb, c.bxb, c.bxc, c.bh, lo.ff_up, c.u_in, c.u_out, c.u_d, c.u_ff, c.u_totd, c.u_totff, npos * d, npos * ff, mp, ff)
-        enc_g4a_silu(enc, c.bh, 0ul, c.u_totff, npos * ff)
+        tw_act(enc, c.bh, GkBiasActArgs(d = uint(0), nelem = uint(npos * ff), boff = 0u, act = BIAS_ACT_SILU))
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_ff_down, rb + 16ul, c.bh, c.bxc, c.bxb, lo.ff_down, c.u_in, c.u_out, c.u_ff, c.u_d, c.u_totff, c.u_totd, npos * ff, npos * d, mp, d)
         pf_enc_rms(enc, c.bxb, 0ul, bw_ffp, c.bxb, c.u_d, c.u_eps, npos)
         enc_g4a_axpy(enc, c.bx, c.bxb, GkAxpyArgs(nelem = uint(npos * d), scale = c.half, zero = 0u), npos * d)
@@ -828,12 +824,12 @@ def private g4a_blocks_body(enc : MetalComputeEncoder?; t : Gemma4aEncoder; c : 
         enc_g4a_glu(enc, c.bh, c.bglu, GkGatedRowsArgs(d = uint(d), nelem = uint(npos * d)), npos * d)
         enc_g4a_dw(enc, c.bglu, c.bcvd, c.bblob, GkDwConvRowsArgs(c = uint(d), t_in = uint(npos), woff = uint(lo.conv_dw)), npos * d)
         pf_enc_rms(enc, c.bcvd, 0ul, bw_cvn, c.bcvd, c.u_d, c.u_eps, npos)
-        enc_g4a_silu(enc, c.bcvd, 0ul, c.u_totd, npos * d)
+        tw_act(enc, c.bcvd, GkBiasActArgs(d = uint(0), nelem = uint(npos * d), boff = 0u, act = BIAS_ACT_SILU))
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_pw2, rb + 112ul, c.bcvd, c.bxc, c.bxb, lo.conv_pw2, c.u_in, c.u_out, c.u_d, c.u_d, c.u_totd, c.u_totd, npos * d, npos * d, mp, d)
         enc_add(enc, c.bx, 0ul, c.bxb, 0ul, c.u_totd, npos * d)
         pf_enc_rms(enc, c.bx, 0ul, bw_ffn1, c.bxb, c.u_d, c.u_eps, npos)
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_ff_up_1, rb + 128ul, c.bxb, c.bxc, c.bh, lo.ff_up_1, c.u_in, c.u_out, c.u_d, c.u_ff, c.u_totd, c.u_totff, npos * d, npos * ff, mp, ff)
-        enc_g4a_silu(enc, c.bh, 0ul, c.u_totff, npos * ff)
+        tw_act(enc, c.bh, GkBiasActArgs(d = uint(0), nelem = uint(npos * ff), boff = 0u, act = BIAS_ACT_SILU))
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_ff_down_1, rb + 144ul, c.bh, c.bxc, c.bxb, lo.ff_down_1, c.u_in, c.u_out, c.u_ff, c.u_d, c.u_totff, c.u_totd, npos * ff, npos * d, mp, d)
         pf_enc_rms(enc, c.bxb, 0ul, bw_ffp1, c.bxb, c.u_d, c.u_eps, npos)
         enc_g4a_axpy(enc, c.bx, c.bxb, GkAxpyArgs(nelem = uint(npos * d), scale = c.half, zero = 0u), npos * d)
@@ -1061,9 +1057,9 @@ def private fc_ctx_release(var c : FcGpuCtx) {
 }
 
 //! a GEMM's bias row-add, skipped where the family has none (a negative offset - parakeet's GEMMs carry no bias)
-def private fc_bias(enc : MetalComputeEncoder?; c : FcGpuCtx; buf : MetalBuffer?; boff : int64; u_w, u_tot : MetalBuffer?; n : int64) {
+def private fc_bias(enc : MetalComputeEncoder?; c : FcGpuCtx; buf : MetalBuffer?; boff, d, n : int64) {
     if (boff >= 0l) {
-        enc_add_bias_rows(enc, buf, 0ul, c.bblob, uint64(boff * 4l), u_w, u_tot, n)
+        tw_bias(enc, buf, c.bblob, GkBiasActArgs(d = uint(d), nelem = uint(n), boff = uint(boff), act = BIAS_ACT_NONE))
     }
 }
 
@@ -1093,26 +1089,26 @@ def private fc_block(enc : MetalComputeEncoder?; c : FcGpuCtx; lo : CanaryLayerO
     let mp = c.mp
     enc_ln(enc, c.bx, c.bblob, uint64(lo.nf1_w * 4l), c.bblob, uint64(lo.nf1_b * 4l), c.bxb, 0ul, c.u_d, c.u_eps, npos)
     fc_mm(enc, c, lo.ff1a_w, c.bxb, c.bh, c.u_d, c.u_ff, mp, ff, d)
-    fc_bias(enc, c, c.bh, lo.ff1a_b, c.u_ff, c.u_totff, npos * ff)
-    enc_g4a_silu(enc, c.bh, 0ul, c.u_totff, npos * ff)
+    fc_bias(enc, c, c.bh, lo.ff1a_b, ff, npos * ff)
+    tw_act(enc, c.bh, GkBiasActArgs(d = uint(0), nelem = uint(npos * ff), boff = 0u, act = BIAS_ACT_SILU))
     fc_mm(enc, c, lo.ff1b_w, c.bh, c.bxb, c.u_ff, c.u_d, mp, d, ff)
-    fc_bias(enc, c, c.bxb, lo.ff1b_b, c.u_d, c.u_totd, npos * d)
+    fc_bias(enc, c, c.bxb, lo.ff1b_b, d, npos * d)
     enc_g4a_axpy(enc, c.bx, c.bxb, GkAxpyArgs(nelem = uint(npos * d), scale = c.half, zero = 0u), npos * d)
     enc_ln(enc, c.bx, c.bblob, uint64(lo.nat_w * 4l), c.bblob, uint64(lo.nat_b * 4l), c.bxb, 0ul, c.u_d, c.u_eps, npos)
     fc_mm(enc, c, lo.q_w, c.bxb, c.bq, c.u_d, c.u_d, mp, d, d)
-    fc_bias(enc, c, c.bq, lo.q_b, c.u_d, c.u_totd, npos * d)
+    fc_bias(enc, c, c.bq, lo.q_b, d, npos * d)
     fc_mm(enc, c, lo.k_w, c.bxb, c.bk, c.u_d, c.u_d, mp, d, d)
-    fc_bias(enc, c, c.bk, lo.k_b, c.u_d, c.u_totd, npos * d)
+    fc_bias(enc, c, c.bk, lo.k_b, d, npos * d)
     fc_mm(enc, c, lo.v_w, c.bxb, c.bv, c.u_d, c.u_d, mp, d, d)
-    fc_bias(enc, c, c.bv, lo.v_b, c.u_d, c.u_totd, npos * d)
+    fc_bias(enc, c, c.bv, lo.v_b, d, npos * d)
     fc_mm(enc, c, lo.pos_w, c.bpos, c.bposl, c.u_d, c.u_d, c.wwp, d, d)
     fc_attention(enc, c, lo)
     fc_mm(enc, c, lo.o_w, c.bao, c.bxb, c.u_d, c.u_d, mp, d, d)
-    fc_bias(enc, c, c.bxb, lo.o_b, c.u_d, c.u_totd, npos * d)
+    fc_bias(enc, c, c.bxb, lo.o_b, d, npos * d)
     enc_add(enc, c.bx, 0ul, c.bxb, 0ul, c.u_totd, npos * d)
     enc_ln(enc, c.bx, c.bblob, uint64(lo.ncv_w * 4l), c.bblob, uint64(lo.ncv_b * 4l), c.bxb, 0ul, c.u_d, c.u_eps, npos)
     fc_mm(enc, c, lo.pw1_w, c.bxb, c.bh, c.u_d, c.u_2d, mp, 2l * d, d)
-    fc_bias(enc, c, c.bh, lo.pw1_b, c.u_2d, c.u_tot2d, npos * 2l * d)
+    fc_bias(enc, c, c.bh, lo.pw1_b, 2l * d, npos * 2l * d)
     enc_g4a_glu(enc, c.bh, c.bglu, GkGatedRowsArgs(d = uint(d), nelem = uint(npos * d)), npos * d)
     var dwa = GkDwConvRowsArgs(c = uint(d), k = uint(c.nk), t_in = uint(npos), woff = uint(lo.dw_w), bnwoff = uint(lo.bn_w), bnboff = uint(lo.bn_b))   //! the args seat wants a non-ref value
     if (c.tap_major) {
@@ -1121,14 +1117,14 @@ def private fc_block(enc : MetalComputeEncoder?; c : FcGpuCtx; lo : CanaryLayerO
         enc_cn_dw(enc, c.bglu, c.bcvd, c.bblob, dwa, npos * d)
     }
     fc_mm(enc, c, lo.pw2_w, c.bcvd, c.bxb, c.u_d, c.u_d, mp, d, d)
-    fc_bias(enc, c, c.bxb, lo.pw2_b, c.u_d, c.u_totd, npos * d)
+    fc_bias(enc, c, c.bxb, lo.pw2_b, d, npos * d)
     enc_add(enc, c.bx, 0ul, c.bxb, 0ul, c.u_totd, npos * d)
     enc_ln(enc, c.bx, c.bblob, uint64(lo.nf2_w * 4l), c.bblob, uint64(lo.nf2_b * 4l), c.bxb, 0ul, c.u_d, c.u_eps, npos)
     fc_mm(enc, c, lo.ff2a_w, c.bxb, c.bh, c.u_d, c.u_ff, mp, ff, d)
-    fc_bias(enc, c, c.bh, lo.ff2a_b, c.u_ff, c.u_totff, npos * ff)
-    enc_g4a_silu(enc, c.bh, 0ul, c.u_totff, npos * ff)
+    fc_bias(enc, c, c.bh, lo.ff2a_b, ff, npos * ff)
+    tw_act(enc, c.bh, GkBiasActArgs(d = uint(0), nelem = uint(npos * ff), boff = 0u, act = BIAS_ACT_SILU))
     fc_mm(enc, c, lo.ff2b_w, c.bh, c.bxb, c.u_ff, c.u_d, mp, d, ff)
-    fc_bias(enc, c, c.bxb, lo.ff2b_b, c.u_d, c.u_totd, npos * d)
+    fc_bias(enc, c, c.bxb, lo.ff2b_b, d, npos * d)
     enc_g4a_axpy(enc, c.bx, c.bxb, GkAxpyArgs(nelem = uint(npos * d), scale = c.half, zero = 0u), npos * d)
     enc_ln(enc, c.bx, c.bblob, uint64(lo.nout_w * 4l), c.bblob, uint64(lo.nout_b * 4l), c.bx, 0ul, c.u_d, c.u_eps, npos)
 }
@@ -1323,13 +1319,13 @@ def private metal_canary_front(t : CanaryEncoder; var st : CanaryState) : int64 
         enc_pk_conv0(enc, bufs[5], bufs[6], btaps, 0ul, bblob, uint64(t.c0_b * 4l), a0, int64(a0.total))
         enc_cn_dw2d(enc, bufs[6], bufs[7], bblob, a2, rows2 * nch)
         enc_f32_mm(enc, bblob, uint64(t.c3_w * 4l), bufs[7], bufs[8], 0ul, u_nch, u_nch, mp2, nch)
-        enc_bias_relu_rows(enc, bufs[8], 0ul, bblob, uint64(t.c3_b * 4l), u_nch, u_tot2, rows2 * nch)
+        tw_bias(enc, bufs[8], bblob, GkBiasActArgs(d = uint(nch), nelem = uint(rows2 * nch), boff = uint(t.c3_b), act = BIAS_ACT_RELU))
         enc_cn_dw2d(enc, bufs[8], bufs[9], bblob, a5, rows3 * nch)
         enc_f32_mm(enc, bblob, uint64(t.c6_w * 4l), bufs[9], bufs[10], 0ul, u_nch, u_nch, mp3, nch)
-        enc_bias_relu_rows(enc, bufs[10], 0ul, bblob, uint64(t.c6_b * 4l), u_nch, u_tot3, rows3 * nch)
+        tw_bias(enc, bufs[10], bblob, GkBiasActArgs(d = uint(nch), nelem = uint(rows3 * nch), boff = uint(t.c6_b), act = BIAS_ACT_RELU))
         enc_pk_xf(enc, bufs[10], bufs[11], axf, mpt * feat)
         enc_f32_mm(enc, bblob, uint64(t.pre_w * 4l), bufs[11], bufs[12], 0ul, u_feat, u_d, mpt, d)
-        enc_add_bias_rows(enc, bufs[12], 0ul, bblob, uint64(t.pre_b * 4l), u_d, u_totd, tt * d)
+        tw_bias(enc, bufs[12], bblob, GkBiasActArgs(d = uint(d), nelem = uint(tt * d), boff = uint(t.pre_b), act = BIAS_ACT_NONE))
     }
     if (ran) {
         ensure_length(st.x, tt * d)
@@ -1435,13 +1431,13 @@ def private metal_parakeet_encode(t : ParakeetModel; var st : ParakeetState) : i
         enc_pk_conv0(enc, bmel, by0, c.bblob, uint64(t.c0_w * 4l), c.bblob, uint64(t.c0_b * 4l), a0, int64(a0.total))
         enc_pk_dw2d(enc, by0, by2, c.bblob, d2, int64(a2.total))
         tw_mm(enc, f16w, false, c.bwh, c.bblob, t.c3_w, by2, bfxh, by3, 0ul, u_nch, u_nch, mp2, nch, nch, true)
-        enc_bias_relu_rows(enc, by3, 0ul, c.bblob, uint64(t.c3_b * 4l), u_nch, u_tot2, rows2 * nch)
+        tw_bias(enc, by3, c.bblob, GkBiasActArgs(d = uint(nch), nelem = uint(rows2 * nch), boff = uint(t.c3_b), act = BIAS_ACT_RELU))
         enc_pk_dw2d(enc, by3, by5, c.bblob, d5, int64(a5.total))
         tw_mm(enc, f16w, false, c.bwh, c.bblob, t.c6_w, by5, bfxh, by6, 0ul, u_nch, u_nch, mp3, nch, nch, true)
-        enc_bias_relu_rows(enc, by6, 0ul, c.bblob, uint64(t.c6_b * 4l), u_nch, u_tot3, rows3 * nch)
+        tw_bias(enc, by6, c.bblob, GkBiasActArgs(d = uint(nch), nelem = uint(rows3 * nch), boff = uint(t.c6_b), act = BIAS_ACT_RELU))
         enc_pk_xf(enc, by6, bxf, axf, c.mp * feat)
         tw_mm(enc, f16w, false, c.bwh, c.bblob, t.pre_w, bxf, bfxh, c.bx, 0ul, u_feat, c.u_d, c.mp, d, feat, true)
-        enc_add_bias_rows(enc, c.bx, 0ul, c.bblob, uint64(t.pre_b * 4l), c.u_d, c.u_totd, tt * d)
+        tw_bias(enc, c.bx, c.bblob, GkBiasActArgs(d = uint(d), nelem = uint(tt * d), boff = uint(t.pre_b), act = BIAS_ACT_NONE))
         for (l in range64(t.n_layer)) {
             fc_block(enc, c, pk_fc_layer(pk_layer_offsets(t, l)), d, 4l * d)
         }
@@ -1544,18 +1540,9 @@ def private metal_gemma4a_chunk(t : Gemma4aEncoder; var s : Gemma4aState; n_len 
     var u_nmel = uniform_u32(uint(n_mel))
     var u_totmel = uniform_u32(uint(n_len * n_mel))
     var u_floor = uniform_f32(gemma4a_mel_floor())
-    var u_iw0 = uniform_u32(uint(n_mel))
-    var u_ih0 = uniform_u32(uint(n_len))
-    var u_ow0 = uniform_u32(uint(w1))
     var u_conv0_k_pad = uniform_u32(uint(conv0_k_pad))
-    var u_totc0 = uniform_u32(uint(rows0 * conv0_k_pad))
     var u_ch0 = uniform_u32(uint(t.sub_ch0))
-    var u_iw1 = uniform_u32(uint(w1))
-    var u_ih1 = uniform_u32(uint(t1))
-    var u_ow1 = uniform_u32(uint(w2))
     var u_kd1 = uniform_u32(uint(kd1))
-    var u_totc1 = uniform_u32(uint(rows1 * kd1))
-    var u_ch1 = uniform_u32(uint(t.sub_ch1))
     var u_conv1_cout_pad = uniform_u32(uint(conv1_cout_pad))
     var u_feat = uniform_u32(uint(feat))
     var err = ""
@@ -1610,18 +1597,9 @@ def private metal_gemma4a_chunk(t : Gemma4aEncoder; var s : Gemma4aState; n_len 
     pool_release(g_upool, u_nmel, 4ul)
     pool_release(g_upool, u_totmel, 4ul)
     pool_release(g_upool, u_floor, 4ul)
-    pool_release(g_upool, u_iw0, 4ul)
-    pool_release(g_upool, u_ih0, 4ul)
-    pool_release(g_upool, u_ow0, 4ul)
     pool_release(g_upool, u_conv0_k_pad, 4ul)
-    pool_release(g_upool, u_totc0, 4ul)
     pool_release(g_upool, u_ch0, 4ul)
-    pool_release(g_upool, u_iw1, 4ul)
-    pool_release(g_upool, u_ih1, 4ul)
-    pool_release(g_upool, u_ow1, 4ul)
     pool_release(g_upool, u_kd1, 4ul)
-    pool_release(g_upool, u_totc1, 4ul)
-    pool_release(g_upool, u_ch1, 4ul)
     pool_release(g_upool, u_conv1_cout_pad, 4ul)
     pool_release(g_upool, u_feat, 4ul)
     g4a_ctx_release(c)
@@ -2064,26 +2042,26 @@ def private metal_gemma3v_blocks(t : Gemma3vTower; var s : Gemma3vState; npos : 
     let ran = with_compute_encoder(g_queue, err) $(enc : MetalComputeEncoder?) {   // nolint:PERF026 — the error-text fetch runs only on the failure leg
         //! the stem: padded patch GEMM + conv bias + the learned positions (all row-aligned)
         enc_f32_mm(enc, bblob, uint64(t.patch_w * 4l), bx0, bx, 0ul, u_pd, u_d, mp, d)
-        enc_add_bias_rows(enc, bx, 0ul, bblob, uint64(t.patch_b * 4l), u_d, u_totd, npos * d)
+        tw_bias(enc, bx, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(t.patch_b), act = BIAS_ACT_NONE))
         enc_add(enc, bx, 0ul, bblob, uint64(t.pos_w * 4l), u_totd, npos * d)
         for (l in range64(t.n_layer)) {
             let o = gemma3v_block_offs(t, l)
             enc_ln(enc, bx, bblob, uint64(o.ln1_w * 4l), bblob, uint64(o.ln1_b * 4l), bxb, 0ul, u_d, u_eps, npos)
             //! the flash reads Q compact, so its Q GEMM lands in bq directly (braw is reused by K/V)
             tw_mm(enc, f16w, false, bwh, bblob, o.w[GEMMA3V_GEMM_Q], bxb, bxh, flash ? bq : braw, 0ul, u_d, u_d, mp, d, d, true)
-            enc_add_bias_rows(enc, flash ? bq : braw, 0ul, bblob, uint64(o.b[GEMMA3V_GEMM_Q] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, flash ? bq : braw, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[GEMMA3V_GEMM_Q]), act = BIAS_ACT_NONE))
             if (!flash) {
                 enc_head_pad(enc, braw, bq, rs_args, npos * t.n_head * hs_pad)
             }
             tw_mm(enc, f16w, false, bwh, bblob, o.w[GEMMA3V_GEMM_K], bxb, bxh, braw, 0ul, u_d, u_d, mp, d, d, false)
-            enc_add_bias_rows(enc, braw, 0ul, bblob, uint64(o.b[GEMMA3V_GEMM_K] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, braw, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[GEMMA3V_GEMM_K]), act = BIAS_ACT_NONE))
             if (!flash) {
                 enc_head_pad(enc, braw, bk, rs_args, npos * t.n_head * hs_pad)
             } else {
                 enc_tower_kv_hc(enc, braw, bkhc, u_hs, u_d, u_np, u_totd, npos * d)
             }
             tw_mm(enc, f16w, false, bwh, bblob, o.w[GEMMA3V_GEMM_V], bxb, bxh, braw, 0ul, u_d, u_d, mp, d, d, false)
-            enc_add_bias_rows(enc, braw, 0ul, bblob, uint64(o.b[GEMMA3V_GEMM_V] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, braw, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[GEMMA3V_GEMM_V]), act = BIAS_ACT_NONE))
             if (!flash) {
                 enc_head_pad(enc, braw, bv, rs_args, npos * t.n_head * hs_pad)
                 enc_qk_mm(enc, bq, bk, batt, ka, mp, nk64, t.n_head)
@@ -2095,14 +2073,13 @@ def private metal_gemma3v_blocks(t : Gemma3vTower; var s : Gemma3vState; npos : 
                 enc_tower_flash(enc, bq, bkhc, bvhc, bxb2, kaf, mp, t.n_head)
             }
             tw_mm(enc, f16w, false, bwh, bblob, o.w[GEMMA3V_GEMM_O], bxb2, bxh, bxb, 0ul, u_d, u_d, mp, d, d, true)
-            enc_add_bias_rows(enc, bxb, 0ul, bblob, uint64(o.b[GEMMA3V_GEMM_O] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bxb, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[GEMMA3V_GEMM_O]), act = BIAS_ACT_NONE))
             enc_add(enc, bx, 0ul, bxb, 0ul, u_totd, npos * d)
             enc_ln(enc, bx, bblob, uint64(o.ln2_w * 4l), bblob, uint64(o.ln2_b * 4l), bxb, 0ul, u_d, u_eps, npos)
             tw_mm(enc, f16w, false, bwh, bblob, o.w[GEMMA3V_GEMM_UP], bxb, bxh, bh, 0ul, u_d, u_ff, mp, ff, d, true)
-            enc_add_bias_rows(enc, bh, 0ul, bblob, uint64(o.b[GEMMA3V_GEMM_UP] * 4l), u_ff, u_totff, npos * ff)
-            enc_gelu_lut(enc, bh, 0ul, u_totff, npos * ff)
+            tw_bias(enc, bh, bblob, GkBiasActArgs(d = uint(ff), nelem = uint(npos * ff), boff = uint(o.b[GEMMA3V_GEMM_UP]), act = BIAS_ACT_GELU_TANH))
             tw_mm(enc, f16w, false, bwh, bblob, o.w[GEMMA3V_GEMM_DOWN], bh, bxh, bxb2, 0ul, u_ff, u_d, mp, d, ff, true)
-            enc_add_bias_rows(enc, bxb2, 0ul, bblob, uint64(o.b[GEMMA3V_GEMM_DOWN] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bxb2, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[GEMMA3V_GEMM_DOWN]), act = BIAS_ACT_NONE))
             enc_add(enc, bx, 0ul, bxb2, 0ul, u_totd, npos * d)
         }
         g3v_tail_body(enc, t, tl, bblob, bx, bxb, u_d, u_eps, npos)
@@ -2264,8 +2241,6 @@ def private metal_qwen3v_blocks(t : Qwen3vTower; var s : Qwen3vState; npos : int
     var u_eps = uniform_f32(t.eps)
     var u_totd = uniform_u32(uint(npos * d))
     var u_totff = uniform_u32(uint(npos * ff))
-    var u_tot4 = uniform_u32(uint(nout * 4l * d))
-    var u_totpr = uniform_u32(uint(nout * proj))
     var u_np_rope = uniform_u32(uint(npos * d / 2l))           // rope pairs over a compact q/k buffer
     var u_neox = uniform_u32(1u)
     var u_pd = uniform_u32(uint(t.patch_dim))
@@ -2289,29 +2264,28 @@ def private metal_qwen3v_blocks(t : Qwen3vTower; var s : Qwen3vState; npos : int
             enc_ln(enc, bx, bblob, uint64(o.ln1_w * 4l), bblob, uint64(o.ln1_b * 4l), bxb, 0ul, u_d, u_eps, npos)
             let wqe = o.w[QWEN3V_GEMM_QKV]   //! the fused qkv rows: q, then k at d·d, v at 2d·d
             tw_mm(enc, f16w, bf16w, bwh, bblob, wqe, bxb, bxh, braw, 0ul, u_d, u_d, mp, d, d, true)
-            enc_add_bias_rows(enc, braw, 0ul, bblob, uint64(o.qkv_b * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, braw, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.qkv_b), act = BIAS_ACT_NONE))
             enc_rope(enc, braw, 0ul, bcos, bsin, u_d, u_hs, u_np_rope, u_neox, null, null, npos * d / 2l)
             enc_head_pad(enc, braw, bq, rs_args, npos * t.n_head * hs_pad)
             tw_mm(enc, f16w, bf16w, bwh, bblob, wqe + d * d, bxb, bxh, braw, 0ul, u_d, u_d, mp, d, d, false)
-            enc_add_bias_rows(enc, braw, 0ul, bblob, uint64((o.qkv_b + d) * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, braw, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint((o.qkv_b + d)), act = BIAS_ACT_NONE))
             enc_rope(enc, braw, 0ul, bcos, bsin, u_d, u_hs, u_np_rope, u_neox, null, null, npos * d / 2l)
             enc_head_pad(enc, braw, bk, rs_args, npos * t.n_head * hs_pad)
             tw_mm(enc, f16w, bf16w, bwh, bblob, wqe + 2l * d * d, bxb, bxh, braw, 0ul, u_d, u_d, mp, d, d, false)
-            enc_add_bias_rows(enc, braw, 0ul, bblob, uint64((o.qkv_b + 2l * d) * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, braw, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint((o.qkv_b + 2l * d)), act = BIAS_ACT_NONE))
             enc_head_pad(enc, braw, bv, rs_args, npos * t.n_head * hs_pad)
             enc_qk_mm(enc, bq, bk, batt, ka, mp, nk64, t.n_head)
             enc_rowstat(enc, batt, ka, bstat, null, npos, t.n_head)
             enc_av_mm(enc, batt, bv, bo_p, ka, bstat, mp, t.n_head, hs_pad)
             enc_head_unpad(enc, bo_p, bxb2, rs_args, npos * t.n_head * hs_pad)
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN3V_GEMM_O], bxb2, bxh, bxb, 0ul, u_d, u_d, mp, d, d, true)
-            enc_add_bias_rows(enc, bxb, 0ul, bblob, uint64(o.out_b * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bxb, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.out_b), act = BIAS_ACT_NONE))
             enc_add(enc, bx, 0ul, bxb, 0ul, u_totd, npos * d)
             enc_ln(enc, bx, bblob, uint64(o.ln2_w * 4l), bblob, uint64(o.ln2_b * 4l), bxb, 0ul, u_d, u_eps, npos)
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN3V_GEMM_UP], bxb, bxh, bh, 0ul, u_d, u_ff, mp, ff, d, true)
-            enc_add_bias_rows(enc, bh, 0ul, bblob, uint64(o.up_b * 4l), u_ff, u_totff, npos * ff)
-            enc_gelu_lut(enc, bh, 0ul, u_totff, npos * ff)
+            tw_bias(enc, bh, bblob, GkBiasActArgs(d = uint(ff), nelem = uint(npos * ff), boff = uint(o.up_b), act = BIAS_ACT_GELU_TANH))
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN3V_GEMM_DOWN], bh, bxh, bxb2, 0ul, u_ff, u_d, mp, d, ff, true)
-            enc_add_bias_rows(enc, bxb2, 0ul, bblob, uint64(o.down_b * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bxb2, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.down_b), act = BIAS_ACT_NONE))
             enc_add(enc, bx, 0ul, bxb2, 0ul, u_totd, npos * d)
             let k = qwen3v_tap_of(t, l)
             if (k >= 0l) {   // the tap merger chain over the live residual's [nout x 4d] merged view
@@ -2319,19 +2293,17 @@ def private metal_qwen3v_blocks(t : Qwen3vTower; var s : Qwen3vState; npos : int
                 let wo = t.ds_w + k * t.ds_w_stride
                 enc_ln(enc, bx, bblob, uint64(fo * 4l), bblob, uint64((fo + 4l * d) * 4l), bm4, 0ul, u_d4, u_eps, nout)
                 tw_mm(enc, f16w, bf16w, bwh, bblob, wo, bm4, bxh, bm4b, 0ul, u_d4, u_d4, mp4, 4l * d, 4l * d, true)
-                enc_add_bias_rows(enc, bm4b, 0ul, bblob, uint64((fo + 8l * d) * 4l), u_d4, u_tot4, nout * 4l * d)
-                enc_gelu_lut(enc, bm4b, 0ul, u_tot4, nout * 4l * d)
+                tw_bias(enc, bm4b, bblob, GkBiasActArgs(d = uint(4l * d), nelem = uint(nout * 4l * d), boff = uint((fo + 8l * d)), act = BIAS_ACT_GELU_TANH))
                 tw_mm(enc, f16w, bf16w, bwh, bblob, wo + 16l * d * d, bm4b, bxh, btap, uint64(k * mp4 * proj * 4l), u_d4, u_pr, mp4, proj, 4l * d, true)
-                enc_add_bias_rows(enc, btap, uint64(k * mp4 * proj * 4l), bblob, uint64((fo + 12l * d) * 4l), u_pr, u_totpr, nout * proj)
+                tw_bias(enc, btap, bblob, GkBiasActArgs(d = uint(proj), nelem = uint(nout * proj), boff = uint((fo + 12l * d)), act = BIAS_ACT_NONE, xoff = uint(k * mp4 * proj)))
             }
         }
         // the tail: post-LN over [npos x d], then the merger MLP over the [nout x 4d] view
         enc_ln(enc, bx, bblob, uint64(t.post_ln_w * 4l), bblob, uint64(t.post_ln_b * 4l), bxb, 0ul, u_d, u_eps, npos)
         tw_mm(enc, f16w, bf16w, bwh, bblob, t.mm0_w, bxb, bxh, bm4b, 0ul, u_d4, u_d4, mp4, 4l * d, 4l * d, true)
-        enc_add_bias_rows(enc, bm4b, 0ul, bblob, uint64(t.mm0_b * 4l), u_d4, u_tot4, nout * 4l * d)
-        enc_gelu_lut(enc, bm4b, 0ul, u_tot4, nout * 4l * d)
+        tw_bias(enc, bm4b, bblob, GkBiasActArgs(d = uint(4l * d), nelem = uint(nout * 4l * d), boff = uint(t.mm0_b), act = BIAS_ACT_GELU_TANH))
         tw_mm(enc, f16w, bf16w, bwh, bblob, t.mm2_w, bm4b, bxh, btail, 0ul, u_d4, u_pr, mp4, proj, 4l * d, true)
-        enc_add_bias_rows(enc, btail, 0ul, bblob, uint64(t.mm2_b * 4l), u_pr, u_totpr, nout * proj)
+        tw_bias(enc, btail, bblob, GkBiasActArgs(d = uint(proj), nelem = uint(nout * proj), boff = uint(t.mm2_b), act = BIAS_ACT_NONE))
     }
     var served = false
     if (ran) {
@@ -2381,8 +2353,6 @@ def private metal_qwen3v_blocks(t : Qwen3vTower; var s : Qwen3vState; npos : int
     pool_release(g_upool, u_eps, 4ul)
     pool_release(g_upool, u_totd, 4ul)
     pool_release(g_upool, u_totff, 4ul)
-    pool_release(g_upool, u_tot4, 4ul)
-    pool_release(g_upool, u_totpr, 4ul)
     pool_release(g_upool, u_np_rope, 4ul)
     pool_release(g_upool, u_neox, 4ul)
     if (!served) {
@@ -2483,8 +2453,6 @@ def private metal_qwen25v_blocks(t : Qwen25vTower; var s : Qwen25vState; npos : 
     var u_eps = uniform_f32(t.eps)
     var u_totd = uniform_u32(uint(npos * d))
     var u_totff = uniform_u32(uint(npos * ff))
-    var u_tot4 = uniform_u32(uint(nout * 4l * d))
-    var u_totpr = uniform_u32(uint(nout * proj))
     var u_np_rope = uniform_u32(uint(npos * d / 2l))           // rope pairs over a compact q/k buffer
     var u_neox = uniform_u32(1u)
     var u_pd = uniform_u32(uint(pd))
@@ -2510,19 +2478,19 @@ def private metal_qwen25v_blocks(t : Qwen25vTower; var s : Qwen25vState; npos : 
             pf_enc_rms(enc, bx, 0ul, bw_ln1, bxb, u_d, u_eps, npos)
             //! the window kernel reads q/k/v compact (bq/bk/bv direct); full layers restride from braw
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN25V_GEMM_Q], bxb, bxh, full ? braw : bq, 0ul, u_d, u_d, mp, d, d, true)
-            enc_add_bias_rows(enc, full ? braw : bq, 0ul, bblob, uint64(o.b[QWEN25V_GEMM_Q] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, full ? braw : bq, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[QWEN25V_GEMM_Q]), act = BIAS_ACT_NONE))
             enc_rope(enc, full ? braw : bq, 0ul, bcos, bsin, u_d, u_hs, u_np_rope, u_neox, null, null, npos * d / 2l)
             if (full) {
                 enc_head_pad(enc, braw, bq, rs_args, npos * t.n_head * hs_pad)
             }
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN25V_GEMM_K], bxb, bxh, full ? braw : bk, 0ul, u_d, u_d, mp, d, d, false)
-            enc_add_bias_rows(enc, full ? braw : bk, 0ul, bblob, uint64(o.b[QWEN25V_GEMM_K] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, full ? braw : bk, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[QWEN25V_GEMM_K]), act = BIAS_ACT_NONE))
             enc_rope(enc, full ? braw : bk, 0ul, bcos, bsin, u_d, u_hs, u_np_rope, u_neox, null, null, npos * d / 2l)
             if (full) {
                 enc_head_pad(enc, braw, bk, rs_args, npos * t.n_head * hs_pad)
             }
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN25V_GEMM_V], bxb, bxh, full ? braw : bv, 0ul, u_d, u_d, mp, d, d, false)
-            enc_add_bias_rows(enc, full ? braw : bv, 0ul, bblob, uint64(o.b[QWEN25V_GEMM_V] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, full ? braw : bv, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[QWEN25V_GEMM_V]), act = BIAS_ACT_NONE))
             if (full) {
                 enc_head_pad(enc, braw, bv, rs_args, npos * t.n_head * hs_pad)
                 enc_qk_mm(enc, bq, bk, batt, ka, mp, nk64, t.n_head)
@@ -2533,25 +2501,24 @@ def private metal_qwen25v_blocks(t : Qwen25vTower; var s : Qwen25vState; npos : 
                 enc_tower_win_attn(enc, bq, bk, bv, bxb2, bwlo, kaw, nwin, t.n_head)
             }
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN25V_GEMM_O], bxb2, bxh, bxb, 0ul, u_d, u_d, mp, d, d, true)
-            enc_add_bias_rows(enc, bxb, 0ul, bblob, uint64(o.b[QWEN25V_GEMM_O] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bxb, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[QWEN25V_GEMM_O]), act = BIAS_ACT_NONE))
             enc_add(enc, bx, 0ul, bxb, 0ul, u_totd, npos * d)
             pf_enc_rms(enc, bx, 0ul, bw_ln2, bxb, u_d, u_eps, npos)
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN25V_GEMM_GATE], bxb, bxh, bh, 0ul, u_d, u_ff, mp, ff, d, true)
-            enc_add_bias_rows(enc, bh, 0ul, bblob, uint64(o.b[QWEN25V_GEMM_GATE] * 4l), u_ff, u_totff, npos * ff)
+            tw_bias(enc, bh, bblob, GkBiasActArgs(d = uint(ff), nelem = uint(npos * ff), boff = uint(o.b[QWEN25V_GEMM_GATE]), act = BIAS_ACT_NONE))
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN25V_GEMM_UP], bxb, bxh, bhu, 0ul, u_d, u_ff, mp, ff, d, false)
-            enc_add_bias_rows(enc, bhu, 0ul, bblob, uint64(o.b[QWEN25V_GEMM_UP] * 4l), u_ff, u_totff, npos * ff)
+            tw_bias(enc, bhu, bblob, GkBiasActArgs(d = uint(ff), nelem = uint(npos * ff), boff = uint(o.b[QWEN25V_GEMM_UP]), act = BIAS_ACT_NONE))
             enc_swiglu(enc, bh, 0ul, bhu, 0ul, u_totff, npos * ff)
             tw_mm(enc, f16w, bf16w, bwh, bblob, o.w[QWEN25V_GEMM_DOWN], bh, bxh, bxb2, 0ul, u_ff, u_d, mp, d, ff, true)
-            enc_add_bias_rows(enc, bxb2, 0ul, bblob, uint64(o.b[QWEN25V_GEMM_DOWN] * 4l), u_d, u_totd, npos * d)
+            tw_bias(enc, bxb2, bblob, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(o.b[QWEN25V_GEMM_DOWN]), act = BIAS_ACT_NONE))
             enc_add(enc, bx, 0ul, bxb2, 0ul, u_totd, npos * d)
         }
         //! the tail: RMS post-norm over [npos x d], then the merger MLP over the [nout x 4d] view
         pf_enc_rms(enc, bx, 0ul, bw_pl, bxb, u_d, u_eps, npos)
         tw_mm(enc, f16w, bf16w, bwh, bblob, t.mm0_w, bxb, bxh, bm4b, 0ul, u_d4, u_d4, mp4, 4l * d, 4l * d, true)
-        enc_add_bias_rows(enc, bm4b, 0ul, bblob, uint64(t.mm0_b * 4l), u_d4, u_tot4, nout * 4l * d)
-        enc_gelu_lut(enc, bm4b, 0ul, u_tot4, nout * 4l * d)
+        tw_bias(enc, bm4b, bblob, GkBiasActArgs(d = uint(4l * d), nelem = uint(nout * 4l * d), boff = uint(t.mm0_b), act = BIAS_ACT_GELU_TANH))
         tw_mm(enc, f16w, bf16w, bwh, bblob, t.mm2_w, bm4b, bxh, btail, 0ul, u_d4, u_pr, mp4, proj, 4l * d, true)
-        enc_add_bias_rows(enc, btail, 0ul, bblob, uint64(t.mm2_b * 4l), u_pr, u_totpr, nout * proj)
+        tw_bias(enc, btail, bblob, GkBiasActArgs(d = uint(proj), nelem = uint(nout * proj), boff = uint(t.mm2_b), act = BIAS_ACT_NONE))
     }
     var served = false
     if (ran) {
@@ -2592,8 +2559,6 @@ def private metal_qwen25v_blocks(t : Qwen25vTower; var s : Qwen25vState; npos : 
     pool_release(g_upool, u_eps, 4ul)
     pool_release(g_upool, u_totd, 4ul)
     pool_release(g_upool, u_totff, 4ul)
-    pool_release(g_upool, u_tot4, 4ul)
-    pool_release(g_upool, u_totpr, 4ul)
     pool_release(g_upool, u_np_rope, 4ul)
     pool_release(g_upool, u_neox, 4ul)
     if (!served) {
@@ -2683,7 +2648,6 @@ def private metal_conv_frontend(t : AudioTower; var s : EncoderState; mel : MelC
     var u_nm3 = uniform_u32(uint(k1))
     var u_d = uniform_u32(uint(d))
     var u_3d = uniform_u32(uint(3l * d))
-    var u_totd1 = uniform_u32(uint(tin * d))
     var u_totd2 = uniform_u32(uint(tt * d))
     var ka1 = St2ConvArgs(cin = uint(nm), k = 3u, stride = 1u, pad_l = 1u, dil = 1u, t_in = uint(tin), r0 = 0u, rows = uint(tin), xs = uint(nm))
     var k2 = St2ConvArgs(cin = uint(d), k = 3u, stride = 2u, pad_l = 1u, dil = 1u, t_in = uint(tin), r0 = 0u, rows = uint(tt), xs = uint(d))
@@ -2695,20 +2659,10 @@ def private metal_conv_frontend(t : AudioTower; var s : EncoderState; mel : MelC
         } else {
             enc_f32_mm(enc, bblob, uint64(t.conv1_w_off * 4l), bx1, by1, 0ul, u_nm3, u_d, mp1, d)
         }
-        enc_add_bias_rows(enc, by1, 0ul, bblob, uint64(t.conv1_b_off * 4l), u_d, u_totd1, tin * d)
-        if (t.gelu_tanh) {
-            enc_gelu_lut(enc, by1, 0ul, u_totd1, tin * d)
-        } else {
-            enc_gelu_erf(enc, by1, 0ul, u_totd1, tin * d)
-        }
+        tw_bias(enc, by1, bblob, GkBiasActArgs(d = uint(d), nelem = uint(tin * d), boff = uint(t.conv1_b_off), act = t.gelu_tanh ? BIAS_ACT_GELU_TANH : BIAS_ACT_GELU_ERF))
         enc_st2_im2col(enc, by1, bx2, k2, mp2 * 3l * d)
         conv2_mm(enc, t, bblob, bx2, bx2h, bxo, u_3d, u_d, mp2)
-        enc_add_bias_rows(enc, bxo, 0ul, bblob, uint64(t.conv2_b_off * 4l), u_d, u_totd2, tt * d)
-        if (t.gelu_tanh) {
-            enc_gelu_lut(enc, bxo, 0ul, u_totd2, tt * d)
-        } else {
-            enc_gelu_erf(enc, bxo, 0ul, u_totd2, tt * d)
-        }
+        tw_bias(enc, bxo, bblob, GkBiasActArgs(d = uint(d), nelem = uint(tt * d), boff = uint(t.conv2_b_off), act = t.gelu_tanh ? BIAS_ACT_GELU_TANH : BIAS_ACT_GELU_ERF))
         enc_add(enc, bxo, 0ul, bblob, uint64(t.pos_off * 4l), u_totd2, tt * d)
     }
     var served = false
@@ -2730,7 +2684,6 @@ def private metal_conv_frontend(t : AudioTower; var s : EncoderState; mel : MelC
     pool_release(g_upool, u_nm3, 4ul)
     pool_release(g_upool, u_d, 4ul)
     pool_release(g_upool, u_3d, 4ul)
-    pool_release(g_upool, u_totd1, 4ul)
     pool_release(g_upool, u_totd2, 4ul)
     return served
 }
@@ -2785,12 +2738,11 @@ def private q3a_wpad_attach(t : Qwen3aTower) : bool {
 
 // one conv2d stage: padded im2col + the f32 tile GEMM + padded bias + erf-GELU
 def private q3a_stage(enc : MetalComputeEncoder?; bsrc, bcol, bout : MetalBuffer?; yoff : uint64; im : GkIm2col2dArgs;
-                      u_kdim, u_ncp, u_tm : MetalBuffer?; tm, mp, ncp : int64; woff, boff : uint64) {
+                      u_kdim, u_ncp : MetalBuffer?; tm, mp, ncp : int64; woff, boff : uint64) {
     var ima = im   //! the dispatch's args seat wants a non-ref value
     enc_im2col2d(enc, bsrc, bcol, ima, int64(im.rows * im.kdp))
     enc_f32_mm(enc, g_tw_q3a_wpad.buf, woff, bcol, bout, yoff, u_kdim, u_ncp, mp, ncp)
-    enc_add_bias_rows(enc, bout, yoff, g_tw_q3a_wpad.buf, boff, u_ncp, u_tm, tm)
-    enc_gelu_erf(enc, bout, yoff, u_tm, tm)
+    tw_bias(enc, bout, g_tw_q3a_wpad.buf, GkBiasActArgs(d = uint(ncp), nelem = uint(tm), boff = uint(boff / 4ul), act = BIAS_ACT_GELU_ERF, xoff = uint(yoff / 4ul)))
 }
 
 //! The qwen3a front for one WINDOW: chunk convs + feature shuffle + conv_out + bias/positions
@@ -2847,28 +2799,25 @@ def private metal_q3a_front(t : Qwen3aTower; win : MelChunk; n_chunks : int64; v
     var u_ncp = uniform_u32(uint(ncp))
     var u_kd32 = uniform_u32(32u)
     var u_k2 = uniform_u32(uint(k2))
-    var u_tm1 = uniform_u32(uint(3200l * ncp))
-    var u_tm2 = uniform_u32(uint(800l * ncp))
-    var u_tm3 = uniform_u32(uint(y3_rows * ncp))
     var u_featw = uniform_u32(uint(featw))
     var u_d = uniform_u32(uint(d))
-    var u_totx = uniform_u32(uint(npos * d))
     var err = ""
     let ran = with_compute_encoder(g_queue, err) $(enc : MetalComputeEncoder?) {   // nolint:PERF026 — the error-text fetch runs only on the failure leg
         for (ci in range64(n_chunks)) {
             q3a_stage(enc, bxin, bcol, by1, 0ul,
                 GkIm2col2dArgs(iw = uint(QWEN3A_CHUNK), ih = uint(nm), cin = 1u, sstride = 1u, kdp = 32u, rows = 3200u, soff = uint(ci * xin_n)),
-                u_kd32, u_ncp, u_tm1, 3200l * ncp, 3200l, ncp, 0ul, uint64(o4 * 4l))
+                u_kd32, u_ncp, 3200l * ncp, 3200l, ncp, 0ul, uint64(o4 * 4l))
             q3a_stage(enc, by1, bcol, by2, 0ul,
                 GkIm2col2dArgs(iw = 50u, ih = 64u, cin = uint(nch), sstride = uint(ncp), kdp = uint(k2), rows = 800u, soff = 0u),
-                u_k2, u_ncp, u_tm2, 800l * ncp, 800l, ncp, uint64(o2 * 4l), uint64((o4 + ncp) * 4l))
+                u_k2, u_ncp, 800l * ncp, 800l, ncp, uint64(o2 * 4l), uint64((o4 + ncp) * 4l))
             q3a_stage(enc, by2, bcol, by3, uint64(ci * mp3 * ncp * 4l),
                 GkIm2col2dArgs(iw = 25u, ih = 32u, cin = uint(nch), sstride = uint(ncp), kdp = uint(k2), rows = uint(y3_rows), soff = 0u),
-                u_k2, u_ncp, u_tm3, y3_rows * ncp, mp3, ncp, uint64(o3 * 4l), uint64((o4 + 2l * ncp) * 4l))
+                u_k2, u_ncp, y3_rows * ncp, mp3, ncp, uint64(o3 * 4l), uint64((o4 + 2l * ncp) * 4l))
         }
         enc_q3a_shuffle(enc, by3, bfeat, GkQ3aShuffleArgs(nch = uint(nch), ncp = uint(ncp), chunk_stride = uint(mp3 * ncp), npos = uint(npos)), npos * featw)
         enc_f32_mm(enc, bcb, uint64(t.cout_w_off * 4l), bfeat, bx, 0ul, u_featw, u_d, mpn, d)
-        enc_q3a_finish(enc, bx, bcb, uint64(t.cout_b_off * 4l), bcb, uint64(t.pos_off * 4l), u_d, u_totx, npos * d)
+        tw_bias(enc, bx, bcb, GkBiasActArgs(d = uint(d), nelem = uint(npos * d), boff = uint(t.cout_b_off), act = BIAS_ACT_NONE))
+        tw_bias(enc, bx, bcb, GkBiasActArgs(d = uint(QWEN3A_TOK_PER_CHUNK * d), nelem = uint(npos * d), boff = uint(t.pos_off), act = BIAS_ACT_NONE))   //! the chunk's 13 position rows as one bias row, the CPU order: (x + b) + pos
     }
     var served = false
     if (ran) {
@@ -2889,12 +2838,8 @@ def private metal_q3a_front(t : Qwen3aTower; win : MelChunk; n_chunks : int64; v
     pool_release(g_upool, u_ncp, 4ul)
     pool_release(g_upool, u_kd32, 4ul)
     pool_release(g_upool, u_k2, 4ul)
-    pool_release(g_upool, u_tm1, 4ul)
-    pool_release(g_upool, u_tm2, 4ul)
-    pool_release(g_upool, u_tm3, 4ul)
     pool_release(g_upool, u_featw, 4ul)
     pool_release(g_upool, u_d, 4ul)
-    pool_release(g_upool, u_totx, 4ul)
     return served
 }
 
@@ -3480,9 +3425,7 @@ def private st2_conv(enc : MetalComputeEncoder?; var c : St2GpuCtx; slot : St2Co
 
 //! The conv's bias over its `rows` output rows, and the conv counted.
 def private st2_conv_bias(enc : MetalComputeEncoder?; var c : St2GpuCtx; slot : St2ConvSlot; by : MetalBuffer?; rows : int64) {
-    let n = rows * slot.cout_p
-    let u_n = st2_u(c, uint(n))
-    enc_add_bias_rows(enc, by, 0ul, c.slab, slot.boff, slot.u_cout, u_n, n)
+    tw_bias(enc, by, c.slab, GkBiasActArgs(d = uint(slot.cout_p), nelem = uint(rows * slot.cout_p), boff = uint(slot.boff / 4ul), act = BIAS_ACT_NONE))
     g_tower_convs++
 }
 
@@ -3496,9 +3439,7 @@ def private st2_mm(enc : MetalComputeEncoder?; c : St2GpuCtx; woff : uint64; bx,
 
 def private st2_lin(enc : MetalComputeEncoder?; var c : St2GpuCtx; slot : St2ConvSlot; bx : MetalBuffer?; rows : int64; by : MetalBuffer?) {
     st2_mm(enc, c, slot.woff, bx, by, 0ul, slot.u_kdim, slot.u_cout, round_up(rows, 32l), slot.cout_p)
-    let n = rows * slot.cout_p
-    let u_n = st2_u(c, uint(n))
-    enc_add_bias_rows(enc, by, 0ul, c.slab, slot.boff, slot.u_cout, u_n, n)
+    tw_bias(enc, by, c.slab, GkBiasActArgs(d = uint(slot.cout_p), nelem = uint(rows * slot.cout_p), boff = uint(slot.boff / 4ul), act = BIAS_ACT_NONE))
 }
 
 def private st2_ln(enc : MetalComputeEncoder?; var c : St2GpuCtx; bx, by : MetalBuffer?; rows, d : int64; eps : float; wbuf : MetalBuffer?; woff, boff : uint64) {
@@ -4882,7 +4823,7 @@ def private pk_gemv(enc : MetalComputeEncoder?; var c : St2GpuCtx; p : PkLin; ki
         if (kind == PK_GEMV_DOT) {
             enc_gemv(enc, bq, qoff, s.bx, s.by, p.u_nin, p.u_nout, p.nout, s.yoff, s.xoff)
             if (p.has_b) {
-                enc_add_bias_rows(enc, s.by, s.yoff, c.slab, boff, p.u_nout, p.u_nout, p.nout)
+                tw_bias(enc, s.by, c.slab, GkBiasActArgs(d = uint(p.nout), nelem = uint(p.nout), boff = uint(boff / 4ul), act = BIAS_ACT_NONE, xoff = uint(s.yoff / 4ul)))
             }
         } elif (kind == PK_GEMV_LN_SILU) {
             enc_pk_gemv_q8_ln_silu(enc, c.slab, boff, bq, qoff, bq, s.bx, s.xoff, s.by, s.yoff, s.bmod, s.mod_off, c.slab, s.ln_w_off, c.slab, s.ln_b_off, ka, p.nout)
@@ -4938,14 +4879,14 @@ def private pk_fr_layer(enc : MetalComputeEncoder?; var c : St2GpuCtx; tf : Pock
     enc_pk_attn(enc, b.qkv, g_tw_pk_voice.bk[li], g_tw_pk_voice.bv[li], b.ctx, ka, tf.heads)
     pk_lin(enc, c, L.out_proj, b.ctx, 0ul, b.xb, 0ul)
     if (L.has_s1) {
-        enc_pk_row_scale(enc, b.xb, 0ul, c.slab, L.scale1_off, u_d, u_d, d)
+        enc_pk_row_scale(enc, b.xb, c.slab, GkBiasActArgs(d = uint(d), nelem = uint(d), boff = uint(L.scale1_off / 4ul), act = BIAS_ACT_NONE), (d + 3l) / 4l)
     }
     pk_add_ln(enc, c, b.x, b.xb, L.n2, b.xb, 0ul, d, tf.eps)
     pk_lin(enc, c, L.ffn1, b.xb, 0ul, b.h, 0ul)
     enc_st2_gelu_tanh(enc, b.h, 0ul, st2_u(c, uint(tf.ffn)), tf.ffn)
     pk_lin(enc, c, L.ffn2, b.h, 0ul, b.xb, 0ul)
     if (L.has_s2) {
-        enc_pk_row_scale(enc, b.xb, 0ul, c.slab, L.scale2_off, u_d, u_d, d)
+        enc_pk_row_scale(enc, b.xb, c.slab, GkBiasActArgs(d = uint(d), nelem = uint(d), boff = uint(L.scale2_off / 4ul), act = BIAS_ACT_NONE), (d + 3l) / 4l)
     }
 }
 
@@ -5097,9 +5038,7 @@ def private pk_rows_lin(enc : MetalComputeEncoder?; var c : St2GpuCtx; p : PkLin
     }
     pf_enc_q8_mm(enc, g_tw_pk_frames.blob, p.qoff, bx, bxh, by, p.u_nin, p.u_nout, mp, p.nout, p.nin)
     if (p.has_b) {
-        let n = rows * p.nout
-        let u_n = st2_u(c, uint(n))
-        enc_add_bias_rows(enc, by, 0ul, c.slab, p.boff, p.u_nout, u_n, n)
+        tw_bias(enc, by, c.slab, GkBiasActArgs(d = uint(p.nout), nelem = uint(rows * p.nout), boff = uint(p.boff / 4ul), act = BIAS_ACT_NONE))
     }
 }
 
@@ -5150,7 +5089,7 @@ def private pk_rows_tf(enc : MetalComputeEncoder?; var c : St2GpuCtx; tf : Pocke
         enc_pk_attn(enc, b.bqkv, cache.bk, cache.bv, b.bctx, ka, tf.heads * t)
         pk_rows_lin(enc, c, s.out_proj, b.bctx, bxh, b.bxb, t)
         if (s.has_s1) {
-            enc_pk_row_scale(enc, b.bxb, 0ul, c.slab, s.scale1_off, u_d, u_nd, nd)
+            enc_pk_row_scale(enc, b.bxb, c.slab, GkBiasActArgs(d = uint(d), nelem = uint(nd), boff = uint(s.scale1_off / 4ul), act = BIAS_ACT_NONE), (nd + 3l) / 4l)
         }
         st2_add(enc, bx, b.bxb, bx, nd, 1.0)
         st2_ln(enc, c, bx, b.bxb, t, d, tf.eps, c.slab, s.n2.gwoff, s.n2.gboff)
@@ -5159,7 +5098,7 @@ def private pk_rows_tf(enc : MetalComputeEncoder?; var c : St2GpuCtx; tf : Pocke
         enc_st2_gelu_tanh(enc, b.bh, 0ul, st2_u(c, uint(nf)), nf)
         pk_rows_lin(enc, c, s.ffn2, b.bh, bxh, b.bxb, t)
         if (s.has_s2) {
-            enc_pk_row_scale(enc, b.bxb, 0ul, c.slab, s.scale2_off, u_d, u_nd, nd)
+            enc_pk_row_scale(enc, b.bxb, c.slab, GkBiasActArgs(d = uint(d), nelem = uint(nd), boff = uint(s.scale2_off / 4ul), act = BIAS_ACT_NONE), (nd + 3l) / 4l)
         }
         st2_add(enc, bx, b.bxb, bx, nd, 1.0)
     }

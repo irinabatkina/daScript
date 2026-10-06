@@ -2733,18 +2733,6 @@ class MetalQkRopeHX : MetalQkRopeT {
     override HX = true
 }
 
-//! x [nrows x n] += b [n] (the tower driver binds biases inside the model blob)
-[metal_dispatch(name = "enc_add_bias_rows", pso = "g_pf_pso_addbias", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalAddBiasRows : MetalRowMapT {
-    def override combine(a, b : float) : float => a + b
-
-    [metal_kernel(name="metal_add_bias_rows_msl")]
-    def metal_add_bias_rows {
-        row_map_body()
-    }
-}
-
-
 struct AttnArgs {
     qd : uint
     kv_dim : uint
@@ -3659,17 +3647,6 @@ class MetalG4aDw : GkDwConvRows {
     }
 }
 
-//! the ew1 family's body under this class's OWN entry name - the census key a serving run records
-[metal_dispatch(name = "enc_g4a_silu", pso = "g_pf_pso_g4a_silu", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalG4aSilu : MetalEw1BaseT {
-    def override map(a : float) : float => a / (1.0 + exp(-a))
-
-    [metal_kernel(name="metal_g4a_silu_msl")]
-    def metal_g4a_silu {
-        ew1_body()
-    }
-}
-
 //! The FastConformer rel-pos attention's shape: compact rows [npos x d], the GEMM pads
 //! (mp rows, nkp key columns, wwpad rel columns) and the CPU form's one scale.
 struct FcAttnArgs {
@@ -4039,17 +4016,6 @@ class MetalTwRelSinCos : GkRelSinCos {
     }
 }
 
-//! x [rows x n] = max(x + v, 0) in place: a 1x1 conv's bias and ReLU over its GEMM's rows.
-[metal_dispatch(name = "enc_bias_relu_rows", pso = "g_pf_pso_bias_relu", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalBiasReluRows : MetalRowMapT {
-    def override combine(a, b : float) : float => max(a + b, 0.0)
-
-    [metal_kernel(name="metal_bias_relu_rows_msl")]
-    def metal_bias_relu_rows {
-        row_map_body()
-    }
-}
-
 //! Spectrum off the DFT GEMM's interleaved re/im rows for k < nbins, 0 in the pad columns (the
 //! mel GEMM's k-pad reads them): the magnitude sqrt(re^2 + im^2) (SQRT) or the power re^2 + im^2.
 [ |> template_struct_instance]
@@ -4261,28 +4227,6 @@ class MetalQ3aLogMelT {
     }
 }
 
-//! The qwen3a conv-frontend epilogue: x += cout bias + the per-chunk position row
-//! (positions reset every 13 rows) — one thread per element.
-[metal_dispatch(name = "enc_q3a_finish", pso = "g_pf_pso_q3a_finish", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalQ3aFinish {
-    @ssbo @binding = 0 @role = "readwrite" x : array<float>     //!< [npos x d]
-    @ssbo @binding = 1 @role = "weight" @off = "boff" bias : array<float>   //!< [d]
-    @ssbo @binding = 2 @role = "weight" @off = "poff" pos : array<float>    //!< [13 x d]
-    @uniform @binding = 3 d : uint
-    @uniform @binding = 4 total : uint      //!< grid guard: npos * d
-
-    [metal_kernel(name="metal_q3a_finish_msl")]
-    def metal_q3a_finish {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        let c = gid % d
-        let row = gid / d
-        x[gid] += bias[c] + pos[(row % 13u) * d + c]
-    }
-}
-
 //! The macaron half-step's scaled residual add, g += u * scale, on the axpy template both homes stamp
 [metal_dispatch(name = "enc_g4a_axpy", pso = "g_pf_pso_g4a_axpy", tg = 64, grid = "nelem/64", params = "nelem : int64")]
 class MetalG4aAxpy : GkAxpy {
@@ -4343,7 +4287,6 @@ def private pf_devw_reload_prep_register {
 var private g_pf_pso_rope : MetalComputePipeline?
 var private g_pf_pso_qkr : MetalComputePipeline?     //!< fused qk_norm+rope (K rows and twin-less panels)
 var private g_pf_pso_qkr_hx : MetalComputePipeline?  //!< its f16 dual-store stamp (the q panel)
-var private g_pf_pso_addbias : MetalComputePipeline?
 var private g_pf_pso_qk : MetalComputePipeline?
 var private g_pf_pso_rowstat : MetalComputePipeline?
 var private g_pf_pso_av : MetalComputePipeline?
@@ -4368,14 +4311,11 @@ var private g_pf_pso_tw_pool2 : MetalComputePipeline?    //!< the whisper-class 
 var private g_pf_pso_tw_swiglu_rows : MetalComputePipeline?   //!< the ultravox projector's row-split gate
 var private g_pf_pso_tw_pool2d : MetalComputePipeline?   //!< a vision tail's k x k mean pool over the row grid
 var private g_pf_pso_tw_affine : MetalComputePipeline?   //!< a vision tail's scale and standardize over rows
-var private g_pf_pso_bias_relu : MetalComputePipeline?   //!< a 1x1 conv's bias and ReLU over its GEMM's rows
 var private g_pf_pso_g4a_attn : MetalComputePipeline?    //!< the gemma4a sliding-window RPE attention
 var private g_pf_pso_g4a_glu : MetalComputePipeline?     //!< its conv-module GLU halves
 var private g_pf_pso_g4a_dw : MetalComputePipeline?      //!< its causal depthwise k=5
-var private g_pf_pso_g4a_silu : MetalComputePipeline?    //!< in-place SiLU
 var private g_pf_pso_g4a_axpy : MetalComputePipeline?    //!< the macaron half-step residual
 var private g_pf_pso_q3a_shuffle : MetalComputePipeline? //!< the qwen3a conv feature shuffle
-var private g_pf_pso_q3a_finish : MetalComputePipeline?  //!< its bias + per-chunk position epilogue
 var private g_pf_pso_q3a_pow : MetalComputePipeline?     //!< power spectrum off the DFT rows
 var private g_pf_pso_q3a_logmel_t : MetalComputePipeline? //!< the mel-major log10 finish
 var private g_pf_pso_g4a_mag : MetalComputePipeline?     //!< magnitude spectrum off the DFT rows
@@ -4744,7 +4684,7 @@ def public metal_prefill_stats() : tuple<prefills : int64; declines : int64> {
 }
 
 //! The tower driver's borrow seat: full prefill PSO bring-up, idempotent — the borrowed builders
-//! (pf_enc_bf16_mm, enc_add_bias_rows; the attention trio next) bind prefill-owned PSOs.
+//! (pf_enc_bf16_mm; the attention trio next) bind prefill-owned PSOs.
 def public metal_prefill_pso_init : bool {
     return metal_prefill_init()
 }
@@ -4758,7 +4698,7 @@ def public metal_prefill_shutdown {
     pf_devw_res_release()   //! resident dev-W panels die with the driver (and any weight refill re-fills)
     pool_drain(g_pf_pool)
     pool_drain(g_pf_upool)
-    release_handles(g_pf_pso_rope, g_pf_pso_qkr, g_pf_pso_qkr_hx, g_pf_pso_addbias, g_pf_pso_cat2, g_pf_pso_half_rows)
+    release_handles(g_pf_pso_rope, g_pf_pso_qkr, g_pf_pso_qkr_hx, g_pf_pso_cat2, g_pf_pso_half_rows)
     release_handles(g_pf_pso_qk, g_pf_pso_rowstat, g_pf_pso_av, g_pf_pso_qkmm, g_pf_pso_qkmm_t, g_pf_pso_qkmm_th)
     release_handles(g_pf_pso_avmm, g_pf_pso_avmm_p, g_pf_pso_avmm_t, g_pf_pso_avmm_tp)
     release_handles(g_pf_pso_qk_dev, g_pf_pso_qk_dev128, g_pf_pso_pexp, g_pf_pso_av_dev, g_pf_pso_av_dev128)
@@ -4796,13 +4736,13 @@ def public metal_prefill_shutdown {
     release_handles(g_pf_pso_moe_mm_iq2xxs_t, g_pf_pso_moe_mm_iq2xxs_th, g_pf_pso_moe_mm_iq2xxs_th128, g_pf_pso_moe_mm_iq2xxs_thr)
     release_handles(g_pf_pso_twr_flash, g_pf_pso_twr_kvhc, g_pf_pso_twr_win)
     release_handles(g_pf_pso_fc_pack, g_pf_pso_fc_softmax, g_pf_pso_fc_unpack, g_pf_pso_cn_dw, g_pf_pso_pk_dw)
-    release_handles(g_pf_pso_pk_conv0, g_pf_pso_pk_dw2d, g_pf_pso_pk_xf, g_pf_pso_bias_relu)
+    release_handles(g_pf_pso_pk_conv0, g_pf_pso_pk_dw2d, g_pf_pso_pk_xf)
     release_handles(g_pf_pso_cn_dw2d, g_pf_pso_tw_rel_sincos)
     release_handles(g_pf_pso_cn_melnorm, g_pf_pso_tw_pool2, g_pf_pso_tw_swiglu_rows, g_pf_pso_tw_pool2d)
     release_handle(g_pf_pso_tw_affine)
-    release_handles(g_pf_pso_g4a_attn, g_pf_pso_g4a_glu, g_pf_pso_g4a_dw, g_pf_pso_g4a_silu, g_pf_pso_g4a_axpy)
+    release_handles(g_pf_pso_g4a_attn, g_pf_pso_g4a_glu, g_pf_pso_g4a_dw, g_pf_pso_g4a_axpy)
     release_handles(g_pf_pso_g4a_mag, g_pf_pso_g4a_logmel, g_pf_pso_g4a_lnrelu)
-    release_handles(g_pf_pso_q3a_shuffle, g_pf_pso_q3a_finish, g_pf_pso_q3a_pow, g_pf_pso_q3a_logmel_t)
+    release_handles(g_pf_pso_q3a_shuffle, g_pf_pso_q3a_pow, g_pf_pso_q3a_logmel_t)
     release_handles(g_pf_pso_ple_gather, g_pf_pso_ple_gather_k4, g_pf_pso_ple_gather_k5, g_pf_pso_ple_gather_q40, g_pf_pso_ple_finish)
     g_pf_inited = false
     g_pf_failed = false
@@ -4897,7 +4837,6 @@ def private metal_prefill_init : bool {   // nolint:STYLE038 — flat one-compil
     g_pf_pso_rope = compile_stamp(metal_rope_msl, ok)
     g_pf_pso_qkr = compile_stamp(MetalQkRope_metal_qk_rope_msl, ok)
     g_pf_pso_qkr_hx = compile_stamp(MetalQkRopeHX_metal_qk_rope_msl, ok)
-    g_pf_pso_addbias = compile_stamp(metal_add_bias_rows_msl, ok)
     g_pf_pso_qk = compile_stamp(metal_attn_qk_msl, ok)
     g_pf_pso_rowstat = compile_stamp(metal_attn_rowstat_msl, ok)
     g_pf_pso_av = compile_stamp(metal_attn_av_msl, ok)
@@ -4989,14 +4928,11 @@ def private metal_prefill_init : bool {   // nolint:STYLE038 — flat one-compil
     g_pf_pso_tw_swiglu_rows = compile_stamp(metal_tw_swiglu_rows_msl, ok)
     g_pf_pso_tw_pool2d = compile_stamp(metal_tw_pool2d_msl, ok)
     g_pf_pso_tw_affine = compile_stamp(metal_tw_affine_rows_msl, ok)
-    g_pf_pso_bias_relu = compile_stamp(metal_bias_relu_rows_msl, ok)
     g_pf_pso_g4a_attn = compile_stamp(metal_g4a_attn_msl, ok)
     g_pf_pso_g4a_glu = compile_stamp(metal_g4a_glu_msl, ok)
     g_pf_pso_g4a_dw = compile_stamp(metal_g4a_dw_msl, ok)
-    g_pf_pso_g4a_silu = compile_stamp(metal_g4a_silu_msl, ok)
     g_pf_pso_g4a_axpy = compile_stamp(metal_g4a_axpy_msl, ok)
     g_pf_pso_q3a_shuffle = compile_stamp(metal_q3a_shuffle_msl, ok)
-    g_pf_pso_q3a_finish = compile_stamp(metal_q3a_finish_msl, ok)
     g_pf_pso_q3a_pow = compile_stamp(metal_q3a_pow_msl, ok)
     g_pf_pso_q3a_logmel_t = compile_stamp(metal_q3a_logmel_t_msl, ok)
     g_pf_pso_g4a_mag = compile_stamp(metal_g4a_mag_msl, ok)
@@ -5283,10 +5219,10 @@ def pf_tower_win_ready() : bool => psos_ready(fixed_array(g_pf_pso_twr_win, g_ps
 //! The FastConformer kernel set compiled — the blocks driver's device gate (LN, GLU, SiLU, axpy
 //! ride the shared/g4a kernels); the depthwise stamp follows the family's tap layout.
 def pf_fc_ready(tap_major : bool) : bool => psos_ready(fixed_array(g_pf_pso_fc_pack, g_pf_pso_fc_softmax, g_pf_pso_fc_unpack, g_pso_f32mm,
-    tap_major ? g_pf_pso_pk_dw : g_pf_pso_cn_dw, g_pf_pso_g4a_glu, g_pf_pso_g4a_silu, g_pf_pso_g4a_axpy, g_pf_pso_tw_rel_sincos))
+    tap_major ? g_pf_pso_pk_dw : g_pf_pso_cn_dw, g_pf_pso_g4a_glu, g_pf_pso_g4a_axpy, g_pf_pso_tw_rel_sincos))
 
 //! The parakeet subsample front's kernels compiled - the whole-encode driver's extra device gate.
-def pf_pk_front_ready() : bool => psos_ready(fixed_array(g_pf_pso_pk_conv0, g_pf_pso_pk_dw2d, g_pf_pso_pk_xf, g_pf_pso_bias_relu, g_pf_pso_addbias))
+def pf_pk_front_ready() : bool => psos_ready(fixed_array(g_pf_pso_pk_conv0, g_pf_pso_pk_dw2d, g_pf_pso_pk_xf))
 
 //! The canary front's kernels compiled - the parakeet front's, the spectrum's and the mel normalization.
 def pf_cn_front_ready() : bool => pf_pk_front_ready() && psos_ready(fixed_array(g_pf_pso_cn_melnorm, g_pf_pso_q3a_pow, g_pf_pso_cn_dw2d))
@@ -5295,13 +5231,13 @@ def pf_cn_front_ready() : bool => pf_pk_front_ready() && psos_ready(fixed_array(
 def pf_tw_tail_ready() : bool => psos_ready(fixed_array(g_pf_pso_tw_pool2, g_pf_pso_tw_swiglu_rows, g_pf_pso_tw_pool2d, g_pf_pso_tw_affine))
 
 //! The gemma4a Conformer kernel set compiled — its tower driver's device gate.
-def pf_g4a_ready() : bool => psos_ready(fixed_array(g_pf_pso_g4a_attn, g_pf_pso_g4a_glu, g_pf_pso_g4a_dw, g_pf_pso_g4a_silu, g_pf_pso_g4a_axpy))
+def pf_g4a_ready() : bool => psos_ready(fixed_array(g_pf_pso_g4a_attn, g_pf_pso_g4a_glu, g_pf_pso_g4a_dw, g_pf_pso_g4a_axpy))
 
 //! The gemma4a mel/front kernel set compiled — the whole-chunk driver's extra device gate.
 def pf_g4a_front_ready() : bool => psos_ready(fixed_array(g_pf_pso_g4a_mag, g_pf_pso_g4a_logmel, g_pf_pso_g4a_lnrelu, g_pso_im2col2d))
 
 //! The qwen3a conv-frontend tail kernels compiled — its front driver's extra device gate.
-def pf_q3a_front_ready() : bool => psos_ready(fixed_array(g_pf_pso_q3a_shuffle, g_pf_pso_q3a_finish))
+def pf_q3a_front_ready() : bool => psos_ready(fixed_array(g_pf_pso_q3a_shuffle))
 
 //! The qwen3a mel kernels compiled — its mel driver's extra device gate.
 def pf_q3a_mel_ready() : bool => psos_ready(fixed_array(g_pf_pso_q3a_pow, g_pf_pso_q3a_logmel_t))
@@ -7340,9 +7276,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     var bbq = upload_region(addr < void? >(t.bq[l * qd_l]), uint64(qd_l * 4l))
                     var bbk = upload_region(addr < void? >(t.bk[l * kvd_l]), uint64(kvd_l * 4l))
                     var bbv = upload_region(addr < void? >(t.bv[l * kvd_l]), uint64(kvd_l * 4l))
-                    enc_add_bias_rows(enc, bq, 0ul, bbq, 0ul, u_qd, u_totq, npos * qd)
-                    enc_add_bias_rows(enc, bks[l], koff, bbk, 0ul, u_kvd, u_totkv, npos * kv_dim)
-                    enc_add_bias_rows(enc, bvs[l], koff, bbv, 0ul, u_kvd, u_totkv, npos * kv_dim)
+                    tw_bias(enc, bq, bbq, GkBiasActArgs(d = uint(qd), nelem = uint(npos * qd), boff = 0u, act = BIAS_ACT_NONE))
+                    tw_bias(enc, bks[l], bbk, GkBiasActArgs(d = uint(kv_dim), nelem = uint(npos * kv_dim), boff = 0u, act = BIAS_ACT_NONE, xoff = uint(koff / 4ul)))
+                    tw_bias(enc, bvs[l], bbv, GkBiasActArgs(d = uint(kv_dim), nelem = uint(npos * kv_dim), boff = 0u, act = BIAS_ACT_NONE, xoff = uint(koff / 4ul)))
                 }
                 //! rot mirrors enc_rope's @default: the null u_rot bind means "the class's own hs"
                 let rot_l = c.rope_dim > 0l && c.rope_dim != head_size ? c.rope_dim : hs_l
@@ -7469,7 +7405,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     }
                     if (c.attn_out_bias) {
                         var bwo_b = upload_region(unsafe(addr < void? >(t.bo[l * dim])), uint64(dim * 4l))
-                        enc_add_bias_rows(enc, bxb2, 0ul, bwo_b, 0ul, u_dim, u_total_dim, npos * dim)
+                        tw_bias(enc, bxb2, bwo_b, GkBiasActArgs(d = uint(dim), nelem = uint(npos * dim), boff = 0u, act = BIAS_ACT_NONE))
                     }
                 }
                 let hid_l = layer_hidden(t, l)

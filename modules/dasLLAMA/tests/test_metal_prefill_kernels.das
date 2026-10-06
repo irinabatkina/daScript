@@ -1283,7 +1283,8 @@ def private bias_relu_rows_gate(t : T?; var dev, queue) {
     let tag = "bias_relu_rows"
     with_metal_cell(dev, queue) $(var mc : MetalCell) {
         var err : string
-        var pso = mc |> keep_stamp(kernel_of(@@enc_bias_relu_rows), err)
+        let st = stamp_of(@@enc_bias_act)
+        var pso = mc |> keep_stamp(st, err)
         return if (!pso_ok(t, tag, pso, err))
         let nrows = 7
         let n = 24
@@ -1298,10 +1299,11 @@ def private bias_relu_rows_gate(t : T?; var dev, queue) {
         t |> success(clamped > 8 && clamped < total - 8, "{tag}: the sums take both signs ({clamped} of {total} clamp)")
         let bx = mc |> io_(x)
         let bb = mc |> in_(b)
-        let bn = mc |> in_plain([uint(n)])
-        let btot = mc |> in_plain([uint(total)])
+        var ka = GkBiasActArgs(d = uint(n), nelem = uint(total), boff = 0u, act = BIAS_ACT_RELU)
         mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
-            enc_bias_relu_rows_pso(enc, pso, mc.buf[bx], 0ul, mc.buf[bb], 0ul, mc.buf[bn], mc.buf[btot], int64(total))
+            stamp_run(st, pso) {
+                invoke(st.enc, enc, mc.buf[bx], mc.buf[bb], ka, int64((total + 3) / 4))
+            }
         }
         check_buf(t, tag, mc.buf[bx], want, BAR_EXACT, Shape(row_width = n))
     }
@@ -2173,12 +2175,11 @@ def private pk_row_scale_gate(t : T?; var dev, queue) {
         }
         let ps = mc |> in_(s)
         var bs = mc.buf[ps]
-        var bc = mc.buf[mc |> in_plain([uint(c)])]
-        var bn = mc.buf[mc |> in_plain([uint(tt * c)])]
+        var ka = GkBiasActArgs(d = uint(c), nelem = uint(tt * c), boff = 16u, act = BIAS_ACT_NONE)   // nolint:LINT003 - the dispatch's args seat wants a non-ref value
         let run <- @(bxx : MetalBuffer?) : bool {
             return queue_record(t, queue, tag) $(enc : MetalComputeEncoder?) {
                 stamp_run(st, pso) {
-                    invoke(st.enc, enc, bxx, 0ul, bs, 64ul, bc, bn, int64(tt * c))
+                    invoke(st.enc, enc, bxx, bs, ka, int64((tt * c + 3) / 4))
                 }
             }
         }
@@ -4015,12 +4016,13 @@ def private ple_finish_gate(t : T?; var dev, queue; nlayers, ple, npos : int) {
     }
 }
 
-// the QKV bias epilogue (MetalAddBiasRows): x[r*n + i] += b[i] in place, BIT-exact
+// the QKV bias epilogue (the shared bias-rows stamp at act NONE): x[r*n + i] += b[i] in place, BIT-exact
 def private add_bias_rows_gate(t : T?; var dev, queue; nrows, n : int) {
     let tag = "add_bias_rows rows={nrows} n={n}"
     with_metal_cell(dev, queue) $(var mc : MetalCell) {
         var err : string
-        var pso = mc |> keep_stamp(kernel_of(@@enc_add_bias_rows), err)
+        let st = stamp_of(@@enc_bias_act)
+        var pso = mc |> keep_stamp(st, err)
         return if (!pso_ok(t, tag, pso, err))
         let total = nrows * n
         var inscope x : array<float>
@@ -4040,10 +4042,11 @@ def private add_bias_rows_gate(t : T?; var dev, queue; nrows, n : int) {
         }
         let bx = mc |> io_(x)
         let bb = mc |> in_(b)
-        let bn = mc |> in_plain([uint(n)])
-        let btot = mc |> in_plain([uint(total)])
+        var ka = GkBiasActArgs(d = uint(n), nelem = uint(total), boff = 0u, act = BIAS_ACT_NONE)
         mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
-            enc_add_bias_rows_pso(enc, pso, mc.buf[bx], 0ul, mc.buf[bb], 0ul, mc.buf[bn], mc.buf[btot], int64(total))
+            stamp_run(st, pso) {
+                invoke(st.enc, enc, mc.buf[bx], mc.buf[bb], ka, int64((total + 3) / 4))
+            }
         }
         check_buf(t, tag, mc.buf[bx], want, BAR_EXACT, Shape(row_width = n))
     }

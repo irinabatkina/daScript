@@ -15,6 +15,7 @@ require dasllama/dasllama_convert   // nolint:STYLE030,LINT019 — cvt_f32_to_f1
 require dasllama/dasllama_tts_blocks
 require dasllama/dasllama_math
 require daslib/jobque_boost
+require dasllama/dasllama_gpu_math   // nolint:STYLE030,LINT019 - the row stamps' activation codes, inside the device arms
 
 //! The TTS tower's sequence classes on Vulkan against the CPU chain (a Vulkan device, else the cells skip; the half
 //! im2col cell also skips where the device serves no f16 tile): the conv im2col in both directions, fed through
@@ -110,7 +111,7 @@ def private im2col_arm(t : T?; tag : string; g : ConvGeom; on_f16_lattice : bool
                 var s_mm = f16_gemm_set(khr, gather_planes(cp.dev, mm), gather_planes(cp.bytes, mm), gather_planes(cp.hazard_bit, mm))
                 var s_b = cp |> cls_set(fixed_array(yp, bp), @@set_tower_bias_act_cls)
                 var pm = F16GemmArgs(n = uint(kdim), d = uint(g.cout), rows = uint(tout), woff = 0u, ybase = 0u, ystride = uint(g.cout), ksplit = 0u)
-                var pb = TowerBiasArgs(d = uint(g.cout), nelem = uint(ny), boff = 0u, act = BIAS_ACT_NONE)
+                var pb = GkBiasActArgs(d = uint(g.cout), nelem = uint(ny), boff = 0u, act = BIAS_ACT_NONE)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_im2col16_cls(raw, h, s_col, pc, int64(tout * kdim))
                     f16_gemm_enc(khr, raw, h, s_mm, pm, int64(tout), int64(g.cout))

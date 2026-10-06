@@ -19,6 +19,7 @@ require dasllama/dasllama_convert
 require dasllama/dasllama_vulkan_common
 require dasllama/dasllama_vulkan_classes
 require dasllama/dasllama_vulkan_tower
+require dasllama/dasllama_gpu_math   // the row stamps' activation codes
 
 //! The Vulkan TTS driver: the kitten and kokoro families' synthesis seats and the Pocket family's
 //! codec, frames and prompt seats on the tower's knob (`ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md`); the Metal
@@ -1805,7 +1806,7 @@ def private ts_pk_elu(raw : VkCommandBuffer; var h : VkHaz; x : TsRows; rows, wi
 //! x [rows][c] *= the slab's scale row at `soff`
 def private ts_pk_row_scale(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; x : TsRows; rows, c, soff : int64) {
     var s = set_tts_pk_row_scale_cls(fixed_array(x.dev, slab.dev), fixed_array(x.bytes, slab.bytes), fixed_array(x.bit, 0u))
-    var pa = TowerBiasArgs(d = uint(c), nelem = uint(rows * c), boff = uint(soff))
+    var pa = GkBiasActArgs(d = uint(c), nelem = uint(rows * c), boff = uint(soff))
     enc_tts_pk_row_scale_cls(raw, h, s, pa, rows * c)
     vt_pt(raw, VtProfRole.tts_pk)
 }
