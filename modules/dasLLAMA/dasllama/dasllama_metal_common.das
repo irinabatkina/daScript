@@ -172,7 +172,8 @@ var g_pso_bias_act : MetalComputePipeline?   //! the bias + activation rows, the
 var g_pso_act_rows : MetalComputePipeline?   //! the activation alone
 var g_pso_posadd : MetalComputePipeline?
 var g_pso_q3v_stem : MetalComputePipeline?   //!< the qwen3v stem assemble (reorder-gather + bias + pos)
-var g_pso_clamp : MetalComputePipeline?        // gemma4v: the ClippableLinear clamp
+var g_pso_clamp : MetalComputePipeline?        // the clamp rows, the template both homes stamp (in place)
+var g_pso_clamp_copy : MetalComputePipeline?   // ... into another buffer
 var g_pso_rope2d : MetalComputePipeline?       // gemma4v: the two-axis NEOX rope
 var g_pso_head_pad : MetalComputePipeline?   //!< the vision towers' head pad onto the attention tiles' width
 var g_pso_head_unpad : MetalComputePipeline?   //!< and the compact rows back off it

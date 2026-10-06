@@ -1196,7 +1196,7 @@ def private vt_mm_clamped(raw : VkCommandBuffer; var h : VkHaz; c : Clamp; var s
     var pc_g = BatchArgs(n = uint(n), d = uint(dout), map_off = map_off)
     vt_tile_enc(raw, h, v, s_gemm, pc_g, groups)
     if (c.active) {
-        var pc_cl = TowerClampArgs(nelem = uint(nout), lo = c.omin, hi = c.omax)
+        var pc_cl = GkClampArgs(nelem = uint(nout), lo = c.omin, hi = c.omax, scale = 1.0)
         enc_tower_clamp_cls(raw, h, s_cl, pc_cl, rq_wgs(false, nout))
     }
 }
@@ -1613,7 +1613,7 @@ def private vt_cn_rel_plane(var r : VtResident; cap, hs : int64; gemm_khr : bool
 }
 
 def private vt_cvt16(raw : VkCommandBuffer; var h : VkHaz; var s : VkDescriptorSet; nelem : int64) {
-    var pc = TowerClampArgs(nelem = uint(nelem), lo = -VT_NO_CLAMP, hi = VT_NO_CLAMP)
+    var pc = GkClampArgs(nelem = uint(nelem), lo = -VT_NO_CLAMP, hi = VT_NO_CLAMP, scale = 1.0)
     enc_tower_clamp_cvt_cls(raw, h, s, pc, (nelem / 4l + 255l) / 256l)
 }
 

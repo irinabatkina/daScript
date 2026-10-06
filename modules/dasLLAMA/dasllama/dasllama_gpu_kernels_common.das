@@ -1539,3 +1539,47 @@ class template GkBiasAct {
     }
 }
 
+struct GkClampArgs {
+    nelem : uint          //! a 4-multiple (every tower width is a 64-multiple)
+    lo : float
+    hi : float
+    scale : float         //! a multiplier ahead of the clamp (the softmax scale a K twin carries; 1 elsewhere)
+    xoff : uint           //! the rows' base in x
+    hoff : uint           //! the rows' base in the half plane or the copy
+}
+
+//! rows clamped to [lo, hi] - in place, into `dst` (COPY: the clamp ahead of an f32 GEMM on Metal), or as halves into `outh` with
+//! the bounds cut to the half range (OUT16: the f16 feed of a clamped GEMM input, or at the half range's bounds the plain
+//! f32 -> f16 rows); four elements an invocation
+[ |> template_struct_instance]
+class template GkClampRows {
+    @template_constant OUT16 : bool = false
+    @template_constant COPY : bool = false
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>
+    @ssbo @binding = 1 @role = "write" @template_gate = OUT16 outh : array<float16>
+    @ssbo @binding = 2 @role = "write" @template_gate = COPY dst : array<float>
+    @kargs pa : GkClampArgs
+
+    def store_clamped(e : uint) : void {
+        let v = x[pa.xoff + e] * pa.scale
+        static_if (OUT16) {
+            outh[pa.hoff + e] = float16(min(max(v, max(pa.lo, -65504.0)), min(pa.hi, 65504.0)))   // nolint:STYLE019,LINT019 - the MSL subset has no clamp lowering; the rule fires where the stamp lands
+        } else {
+            static_if (COPY) {
+                dst[pa.hoff + e] = min(max(v, pa.lo), pa.hi)   // nolint:STYLE019,LINT019 - the same
+            } else {
+                x[pa.xoff + e] = min(max(v, pa.lo), pa.hi)   // nolint:STYLE019,LINT019 - the same
+            }
+        }
+    }
+
+    def clamp_rows_body {
+        let e = gl_GlobalInvocationID.x * 4u
+        if (e < pa.nelem) {
+            store_clamped(e)
+            store_clamped(e + 1u)
+            store_clamped(e + 2u)
+            store_clamped(e + 3u)
+        }
+    }
+}

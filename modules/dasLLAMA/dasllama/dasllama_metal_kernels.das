@@ -3633,6 +3633,7 @@ def metal_decode_init : bool {   // nolint:STYLE038 — a flat compile_pso per k
     g_pso_posadd = compile_stamp(metal_posadd2d_msl, ok)
     g_pso_q3v_stem = compile_stamp(metal_q3v_stem_msl, ok)
     g_pso_clamp = compile_stamp(metal_clamp_msl, ok)
+    g_pso_clamp_copy = compile_stamp(metal_clamp_copy_msl, ok)
     g_pso_rope2d = compile_stamp(metal_rope2d_msl, ok)
     g_pso_head_pad = compile_stamp(metal_head_pad_msl, ok)
     g_pso_head_unpad = compile_stamp(metal_head_unpad_msl, ok)
@@ -4672,7 +4673,7 @@ def metal_kernels_release {
     release_handles(g_pso_kq_mm_b40, g_pso_kq_k2, g_pso_kq_mvb2_k2, g_pso_kq_mvb4_k2, g_pso_kq_mvb8_k2, g_pso_kq_mm_b2)
     release_handles(g_pso_rms, g_pso_rms_hx, g_pso_dn_ba, g_pso_moe_router_b, g_pso_add, g_pso_addrms_hx)
     release_handles(g_pso_addrms, g_pso_preaddrms, g_one, g_zero, g_pso_geglu, g_pso_geglu_hx)
-    release_handles(g_pso_ln, g_pso_bias_act, g_pso_act_rows, g_pso_posadd, g_pso_q3v_stem, g_pso_clamp)
+    release_handles(g_pso_ln, g_pso_bias_act, g_pso_act_rows, g_pso_posadd, g_pso_q3v_stem, g_pso_clamp, g_pso_clamp_copy)
     release_handles(g_pso_rope2d, g_pso_head_pad, g_pso_head_unpad, g_pso_geglu_quick, g_pso_cross_kx, g_pso_cross_vx, g_pso_cross_vx_h)
     release_handles(g_pso_im2col2d, g_pso_wdec_attn_part, g_pso_wdec_attn_comb, g_pso_bias_add_res)
     release_handles(g_pso_f32mm, g_pso_softcap, g_pso_suppress, g_pso_swiglu, g_pso_swiglu_hx, g_pso_swiglu_hxb)
@@ -5199,27 +5200,36 @@ class MetalQ3vStemAsm {
     }
 }
 
-// The ClippableLinear clamp (gemma4v): dst = clamp(src, lo, hi), the bounds read off the tower's
-// f32 blob at the GEMM's clamp record (imin imax omin omax …; `side` 0 = input pair, 1 = output
-// pair). dst may be src (each thread owns one element); an inactive record holds ±FLT_MAX = identity.
-[metal_dispatch(name = "enc_clamp", pso = "g_pso_clamp", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalClamp {
-    @ssbo @binding = 0 @role = "read" @off = "soff" @span = "total*4" src : array<float>
-    @ssbo @binding = 1 @role = "write" @off = "doff" @span = "total*4" dst : array<float>
-    @ssbo @binding = 2 @role = "weight" @off = "boff" bounds : array<float>   // [imin imax omin omax] at the record
-    @uniform @binding = 3 side : uint
-    @uniform @binding = 4 total : uint
-
-    [metal_kernel(name="metal_clamp_msl")]
+//! rows clamped in place, the template both homes stamp (`tw_clamp` sizes the grid: the elements over four)
+[metal_dispatch(name = "enc_clamp_rows", pso = "g_pso_clamp", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalClampRows : GkClampRows {
+    [metal_kernel(name = "metal_clamp_msl")]
     def metal_clamp {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        let lo = bounds[side * 2u]
-        let hi = bounds[side * 2u + 1u]
-        dst[gid] = min(max(src[gid], lo), hi)   // nolint:STYLE019 — the MSL subset has no clamp lowering
+        clamp_rows_body()
     }
+}
+
+//! the clamped rows into another buffer: a clamped GEMM's input copy ahead of the f32 tile, the source left whole
+[metal_dispatch(name = "enc_clamp_copy", pso = "g_pso_clamp_copy", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalClampCopy : GkClampRows {
+    override COPY = true
+
+    [metal_kernel(name = "metal_clamp_copy_msl")]
+    def metal_clamp_copy {
+        clamp_rows_body()
+    }
+}
+
+//! `n` elements of `bx` clamped to [lo, hi] in place
+def tw_clamp(enc : MetalComputeEncoder?; bx : MetalBuffer?; lo, hi : float; n : int64) {
+    var a = GkClampArgs(nelem = uint(n), lo = lo, hi = hi, scale = 1.0)
+    enc_clamp_rows(enc, bx, a, (n + 3l) / 4l)
+}
+
+//! `n` elements of `bx` clamped to [lo, hi] into `bdst`
+def tw_clamp_copy(enc : MetalComputeEncoder?; bx, bdst : MetalBuffer?; lo, hi : float; n : int64) {
+    var a = GkClampArgs(nelem = uint(n), lo = lo, hi = hi, scale = 1.0)
+    enc_clamp_copy(enc, bx, bdst, a, (n + 3l) / 4l)
 }
 
 //! The head restride around the attention tiles (gemma3v, the qwen vision towers), on the template both homes stamp: the pad

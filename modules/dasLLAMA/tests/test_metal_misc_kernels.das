@@ -419,8 +419,9 @@ def private clamp_gate(t : T?; var dev, queue; total : int; side : int; inplace 
     let tag = "clamp total={total} {side == CLAMP_IN ? "in" : "out"} inplace={inplace}"
     with_metal_cell(dev, queue) $(var mc : MetalCell) {
         var err : string
-        let st = stamp_of(@@enc_clamp)
-        var pso = mc |> keep_stamp(st, err)
+        let st = stamp_of(@@enc_clamp_rows)
+        let sc = stamp_of(@@enc_clamp_copy)
+        var pso = inplace ? (mc |> keep_stamp(st, err)) : (mc |> keep_stamp(sc, err))
         return if (!pso_ok(t, tag, pso, err))
         var inscope src : array<float>
         src |> resize(total)
@@ -441,12 +442,16 @@ def private clamp_gate(t : T?; var dev, queue; total : int; side : int; inplace 
         }
         let bs = mc |> io_(src)
         let bd = inplace ? bs : (mc |> out_words(total + 16, -1000.0))
-        let brec = mc |> in_(rec)
-        let bside = mc |> in_plain([uint(side)])
-        let btot = mc |> in_plain([uint(total)])
+        var ka = GkClampArgs(nelem = uint(total), lo = lo, hi = hi, scale = 1.0)   // the bounds the record carries, read on the host
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
-            stamp_run(st, pso) {   // the record starts 3 floats in
-                invoke(st.enc, enc, mc.buf[bs], 0ul, mc.buf[bd], 0ul, mc.buf[brec], 12ul, mc.buf[bside], mc.buf[btot], int64(total))
+            if (inplace) {
+                stamp_run(st, pso) {
+                    invoke(st.enc, enc, mc.buf[bs], ka, int64((total + 3) / 4))
+                }
+            } else {
+                stamp_run(sc, pso) {
+                    invoke(sc.enc, enc, mc.buf[bs], mc.buf[bd], ka, int64((total + 3) / 4))
+                }
             }
         }
         return if (!ran)

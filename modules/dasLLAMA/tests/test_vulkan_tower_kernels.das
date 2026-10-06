@@ -430,8 +430,8 @@ def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over t
                 var pa_post_plain = TowerLnArgs(d = uint(d), rows = uint(rows), woff = 0u, boff = 0u, eps = ROWS_EPS, ln_on = 1u, lnoff = 0u, lnboff = 0u, ascale = 0.5)
                 var pa_post_plain0 = TowerLnArgs(d = uint(d), rows = uint(rows), woff = 0u, boff = 0u, eps = ROWS_EPS, ln_on = 0u, lnoff = 0u, lnboff = 0u, ascale = 0.5)
                 var pa_post_half = TowerLnArgs(d = uint(d), rows = uint(rows), woff = uint(d), boff = 0u, eps = ROWS_EPS, ln_on = 0u, lnoff = 0u, lnboff = 0u, ascale = 0.5)
-                var pa_clamp = TowerClampArgs(nelem = uint(nd), lo = lo, hi = hi)
-                var pa_cvt = TowerClampArgs(nelem = uint(nd), lo = lo2, hi = hi2)
+                var pa_clamp = GkClampArgs(nelem = uint(nd), lo = lo, hi = hi, scale = 1.0)
+                var pa_cvt = GkClampArgs(nelem = uint(nd), lo = lo2, hi = hi2, scale = 1.0)
                 var pa_rq = RqArgs(inbase = 0u, nblk = uint(nd / q8e), lo = lo2, hi = hi2)
                 var pa_rope = GkRope2dArgs(nheads = uint(ROWS_HEADS), hs = uint(hs), rows = uint(rows))
                 var pa_geglu = TowerGegluArgs(nelem = uint(nff), glo = -2.0, ghi = 2.5, ulo = -1.5, uhi = 1.75, dlo = -1.0, dhi = 1.2)
@@ -1615,7 +1615,7 @@ def test_vkt_tower_front_movers(t0 : T?) {   // nolint:STYLE038 — one flat gat
                     soff = uint(second_head_base), boff = uint(second_head_base))
                 var pa_gp = GkRestrideArgs(rows = uint(rows), rows_pad = uint(rows), nheads = 1u, hs = uint(hs), hsp = uint(hs), sstride = uint(d),
                     soff = uint(second_head_base))
-                var pa_cvt = TowerClampArgs(nelem = uint(nd), lo = -1.5, hi = 1.5)
+                var pa_cvt = GkClampArgs(nelem = uint(nd), lo = -1.5, hi = 1.5, scale = 1.0)
                 var pa_add = GkBiasActArgs(d = uint(add_n), nelem = uint(add_n), boff = uint(d), act = BIAS_ACT_NONE)   // the stem's position plane: one bias row the width of the rows
                 var pa_fin_b = GkBiasActArgs(d = uint(d), nelem = uint(nd), boff = uint(2 * d), act = BIAS_ACT_NONE)
                 var pa_fin_p = GkBiasActArgs(d = uint(q3_tok * d), nelem = uint(nd), boff = uint(3 * d), act = BIAS_ACT_NONE)

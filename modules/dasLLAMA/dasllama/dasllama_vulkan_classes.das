@@ -9380,53 +9380,29 @@ class QkRms : WgReduceBase {
     }
 }
 
-struct TowerClampArgs {
-    nelem : uint    //! a 4-multiple (every tower width is a 64-multiple)
-    lo : float
-    hi : float
-}
-
-//! rows clamped to [lo, hi] in place (a gemma4v ClippableLinear's output bounds), or under OUT16 stored as halves into `outh`
-//! with the bounds cut to the half range - the f16 feed of a clamped GEMM input, the input bounds applied on the way into the
-//! tile so the normed rows stay whole for the next GEMM's own bounds (at the half range's bounds, `f16_rows_args`: the plain f32 -> f16 rows)
-[ |> template_struct_instance]
-class template TowerClampT {
-    @template_constant OUT16 : bool = false
-    @ssbo @binding = 0 @template_gate = "!OUT16" x : array<float>
-    @ssbo @binding = 0 @template_gate = OUT16 src : array<float>
-    @ssbo @binding = 1 @template_gate = OUT16 outh : array<float16>
-    @push_constant pa : TowerClampArgs
-
-    def store_clamped(e : uint) : void {
-        static_if (OUT16) {
-            outh[e] = float16(clamp(src[e], max(pa.lo, -65504.0), min(pa.hi, 65504.0)))
-        } else {
-            x[e] = clamp(x[e], pa.lo, pa.hi)
-        }
-    }
-
-    [spirv_kernel(local_size_x = 256)]
-    def run {
-        let e = gl_GlobalInvocationID.x * 4u
-        if (e < pa.nelem) {
-            store_clamped(e)
-            store_clamped(e + 1u)
-            store_clamped(e + 2u)
-            store_clamped(e + 3u)
-        }
-    }
-}
-
+//! rows clamped in place (a gemma4v ClippableLinear's output bounds), on the template both homes stamp
 [vk_dispatch(name = "tower_clamp_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
-class TowerClamp : TowerClampT {}
+class TowerClamp : GkClampRows {
+    [spirv_kernel(local_size_x = 256, name = "tower_clamp_cls_spv")]
+    def run {
+        clamp_rows_body()
+    }
+}
 
+//! the f16 feed of a clamped GEMM input: the input bounds applied on the way into the tile so the normed rows stay whole for
+//! the next GEMM's own bounds (at the half range's bounds, `f16_rows_args`: the plain f32 -> f16 rows)
 [vk_dispatch(name = "tower_clamp_cvt_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
-class TowerClampCvt : TowerClampT {
+class TowerClampCvt : GkClampRows {
     override OUT16 = true
+
+    [spirv_kernel(local_size_x = 256, name = "tower_clamp_cvt_cls_spv")]
+    def run {
+        clamp_rows_body()
+    }
 }
 
 //! `tower_clamp_cvt_cls`'s push over `nelem` floats at the half range's bounds: the plain f32 -> f16 rows
-def f16_rows_args(nelem : uint) : TowerClampArgs => TowerClampArgs(nelem = nelem, lo = -65504.0, hi = 65504.0)
+def f16_rows_args(nelem : uint) : GkClampArgs => GkClampArgs(nelem = nelem, lo = -65504.0, hi = 65504.0, scale = 1.0)
 
 //! the Q8_0 feed of a clamped GEMM input: the requant over the clamped elements (the mm and KHR modes' tile feed)
 [vk_dispatch(name = "tower_clamp_rq_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
@@ -12829,7 +12805,7 @@ def vt_tile_enc(raw : VkCommandBuffer; var h : VkHaz; t : VtTile; var s : VkDesc
 //! a GEMM input's feed off its f32 rows: the clamp + halfword store on the cm2 feed, the clamp + Q8_0 requant on the mul_mm tiles
 def vt_feed_enc(raw : VkCommandBuffer; var h : VkHaz; cm2 : bool; var s_rq : VkDescriptorSet; var pc_rq : RqArgs; nelem : int64) {
     if (cm2) {
-        var pc = TowerClampArgs(nelem = uint(nelem), lo = pc_rq.lo, hi = pc_rq.hi)
+        var pc = GkClampArgs(nelem = uint(nelem), lo = pc_rq.lo, hi = pc_rq.hi, scale = 1.0)
         enc_tower_clamp_cvt_cls(raw, h, s_rq, pc, (nelem / 4l + 255l) / 256l)
     } else {
         enc_tower_clamp_rq_cls(raw, h, s_rq, pc_rq, rq_wgs(false, nelem))

@@ -170,34 +170,28 @@ struct CvtArgs {
     total : uint
 }
 
-struct HalfRowsArgs {
-    total : uint
-    scale : float
-}
+//! f32 elements to halves at an element base of the target, scaled: an activation panel's twin, an attention K or V panel's
+//! twin (the softmax scale on K), a window's K and V rows into the KV mirror, its Q rows under the scale the mirror carries; the
+//! clamp template's f16 arm at the half range's bounds (`total` = the elements over four)
+[metal_dispatch(name = "enc_half_rows", pso = "g_pf_pso_half_rows", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalHalfRows : GkClampRows {
+    override OUT16 = true
 
-//! f32 elements to halves at a byte offset of the target, scaled: an activation panel's twin, an attention K or V panel's
-//! twin (the softmax scale on K), a window's K and V rows into the KV mirror, its Q rows under the scale the mirror's K lacks.
-[metal_dispatch(name = "enc_half_rows", pso = "g_pf_pso_half_rows", tg = 256, grid = "total/256", params = "total : int64")]
-class MetalHalfRows {
-    @ssbo @binding = 0 @role = "read" x : array<float>
-    @ssbo @binding = 1 @role = "write" @off = "hoff" @span = "total*2" xh : array<float16>
-    @uniform @binding = 2 ka : HalfRowsArgs
-
-    [metal_kernel(name="metal_half_rows_msl")]
+    [metal_kernel(name = "metal_half_rows_msl")]
     def metal_half_rows {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= ka.total) {
-            return
-        }
-        xh[gid] = float16(min(max(x[gid] * ka.scale, -65504.0), 65504.0))   // nolint:STYLE019 — the MSL emitter lowers min/max only, no clamp; the host convert clamps the same way
+        clamp_rows_body()
     }
 }
 
-//! `n` f32 elements of `bx` as halves at the start of `bxh`, unscaled; `grid` is the dispatch's element span where a caller
-//! rounds it past `n` (-1 = `n`).
-def enc_cvt_half(enc : MetalComputeEncoder?; bx, bxh : MetalBuffer?; n : int64; grid : int64 = -1l) {
-    var ha = HalfRowsArgs(total = uint(n), scale = 1.0)
-    enc_half_rows(enc, bx, bxh, 0ul, ha, grid < 0l ? n : grid)
+//! `n` f32 elements of `bx` as halves at element `hoff` of `bxh`, scaled by `scale`
+def tw_half(enc : MetalComputeEncoder?; bx, bxh : MetalBuffer?; n : int64; scale : float = 1.0; hoff : uint64 = 0ul) {
+    var a = GkClampArgs(nelem = uint(n), lo = -65504.0, hi = 65504.0, scale = scale, hoff = uint(hoff))
+    enc_half_rows(enc, bx, bxh, a, (n + 3l) / 4l)
+}
+
+//! `n` f32 elements of `bx` as halves at the start of `bxh`, unscaled
+def enc_cvt_half(enc : MetalComputeEncoder?; bx, bxh : MetalBuffer?; n : int64) {
+    tw_half(enc, bx, bxh, n)
 }
 
 [metal_dispatch(name = "enc_dequant_q8h", pso = "g_pf_pso_dq_q8", tg = 256, grid = "total/256", params = "total : int64")]
@@ -3307,10 +3301,8 @@ class MetalAttnAVMmP : MetalAttnAVMmSgT {
 
 //! A K and a V panel of `total` elements as halves, the softmax scale on K: the device pair's twins.
 def enc_kv_twin(enc : MetalComputeEncoder?; bk, bv, bkh, bvh : MetalBuffer?; scale : float; total : int64) {
-    var ha = HalfRowsArgs(total = uint(total), scale = scale)
-    enc_half_rows(enc, bk, bkh, 0ul, ha, total)
-    ha.scale = 1.0
-    enc_half_rows(enc, bv, bvh, 0ul, ha, total)
+    tw_half(enc, bk, bkh, total, scale)
+    tw_half(enc, bv, bvh, total)
 }
 
 [ |> template_struct_instance]
@@ -7176,7 +7168,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         var bdt = upload_region(addr < void? >(t.fblob[t.dn_dt_off + l * nvh_dn]), uint64(nvh_dn * 4l))
                         if (bdncvh != null) {
                             //! the walk reads halves: the conv rows convert once, the gates prepare once
-                            enc_cvt_half(enc, bdncv, bdncvh, npos * cd_dn, (npos * cd_dn + 255l) / 256l * 256l)
+                            enc_cvt_half(enc, bdncv, bdncvh, npos * cd_dn)
                             enc_dn_prep(enc, bdnb, bdng, baa, bdt, dka, (npos * nvh_dn + 63l) / 64l * 64l)
                             enc_dn_scan_h(enc, bdncvh, bdn_state, soff, bdnb, bdng, baa, bdt, bdno,
                                 bdn_state, soff, dka, c.ssm_d_state, nvh_dn)
@@ -7331,10 +7323,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     }
                 }
                 if (mirk && !recr && !kvsh) {
-                    var hka = HalfRowsArgs(total = uint(npos * kvd_l), scale = 1.0)
                     let rows_off = uint64(start_pos * kvd_l * 2l)
-                    enc_half_rows(enc, bks[l], g_arena, mir_kb + rows_off, hka, npos * kvd_l)
-                    enc_half_rows(enc, bvs[l], g_arena, mir_vb + rows_off, hka, npos * kvd_l)
+                    tw_half(enc, bks[l], g_arena, npos * kvd_l, 1.0, (mir_kb + rows_off) / 2ul)
+                    tw_half(enc, bvs[l], g_arena, npos * kvd_l, 1.0, (mir_vb + rows_off) / 2ul)
                 }
                 if (!recr && g_pf_skip != "attn" && g_pf_skip != "nongemm") {
                     var atka = AttnArgs(qd = uint(qd_l), kv_dim = uint(kvd_l), head_size = uint(hs_l),
@@ -7351,8 +7342,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                         bqh_l = bqh_q
                     } elif (mirk) {   //! the unfused rope left no twin: Q's halves carry the softmax scale
                         bqh_l = pf_twin_panel(mp, qd_l)
-                        var qha = HalfRowsArgs(total = uint(mp * qd_l), scale = scale_l)
-                        enc_half_rows(enc, bq, bqh_l, 0ul, qha, mp * qd_l)
+                        tw_half(enc, bq, bqh_l, mp * qd_l, scale_l)
                     } elif (mmattn) {
                         bqh_l = pf_cvt_panel(enc, bq, mp, qd_l, g_pf_skip == "act_cvt")
                     }
@@ -8687,15 +8677,15 @@ def private race_attn_dev(dev : MetalDevice?; queue : MetalCommandQueue?) : Meta
         var rka = AttnArgs(qd = uint(qd), kv_dim = uint(kvd), head_size = uint(hs), kv_mul = uint(kv_mul),
             npos = uint(nk), np32 = uint(nk), scale = 0.125, qoff = uint(qoff), qrows = uint(mp),
             window = 0u, softcap = 0.0, hass = 0u)
-        var tka = HalfRowsArgs(total = uint(nk * kvd), scale = rka.scale)
-        var tva = HalfRowsArgs(total = uint(nk * kvd), scale = 1.0)
+        var tka = GkClampArgs(nelem = uint(nk * kvd), lo = -65504.0, hi = 65504.0, scale = rka.scale)
+        var tva = GkClampArgs(nelem = uint(nk * kvd), lo = -65504.0, hi = 65504.0, scale = 1.0)
         race_pair_ms(queue, 5, res.base_ms, res.twin_ms, $(enc) {
             enc_qk_mm_th_c_pso(enc, psos[0], bqh, bkk, batt_b, rka, int64(mp), int64(nk), int64(heads))
             enc_rowstat_pso(enc, psos[1], batt_b, rka, bstat_b, bsink, int64(mp), int64(heads))
             enc_av_mm_p_c_pso(enc, psos[2], batt_b, bkk, bxb_b, rka, bstat_b, int64(mp), int64(heads), int64(hs))
         }, $(enc) {
-            enc_half_rows_pso(enc, psos[3], bkk, bkh, 0ul, tka, int64(nk * kvd))
-            enc_half_rows_pso(enc, psos[3], bkk, bvh, 0ul, tva, int64(nk * kvd))
+            enc_half_rows_pso(enc, psos[3], bkk, bkh, tka, int64((nk * kvd + 3) / 4))
+            enc_half_rows_pso(enc, psos[3], bkk, bvh, tva, int64((nk * kvd + 3) / 4))
             enc_qk_dev128_c_pso(enc, psos[4], bqh, bkh, 0ul, batt_t, rka, int64(mp), int64(nk), int64(heads))
             enc_attn_pexp_pso(enc, psos[5], batt_t, rka, bstat_t, bsink, int64(mp), int64(heads))
             enc_av_dev128_c_pso(enc, psos[6], batt_t, bvh, 0ul, bxb_t, rka, bstat_t, int64(mp), int64(heads), int64(hs / 64))
