@@ -362,7 +362,6 @@ let private ROWS_FF = 512
 let private ROWS_HEADS = 4
 let private ROWS_EPS = 1.0e-6
 
-def private gelu_quick_ref(x : float) : float => x * (1.0 / (1.0 + exp(-1.702 * x)))
 
 [test]
 def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over the eight row classes: the fixture, one command buffer, eight oracles and their controls
@@ -540,9 +539,9 @@ def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over t
                 for (i in range(nff)) {
                     let gv = clamp(g[i], -2.0, 2.5)
                     let uv = clamp(u[i], -1.5, 1.75)
-                    g_ref[i] = clamp(gelu_quick_ref(gv) * uv, -1.0, 1.2)
+                    g_ref[i] = clamp(gelu_quick_lut_f32(gv) * uv, -1.0, 1.2)
                 }
-                check_rows(t, "tower_geglu clamped GEGLU-quick vs its closed form", g_dev, g_ref, BAR_APPROX, ff)
+                check_rows(t, "tower_geglu clamped GEGLU-quick vs the CPU table form", g_dev, g_ref, BAR_APPROX, ff)
             }
         } else {
             t |> skip("dasVulkan not present")

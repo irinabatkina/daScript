@@ -5115,15 +5115,10 @@ class template MetalEw1T : MetalEw1BaseT {
 }
 
 // The tower GELUs are FORM-MATCHED per model, never substituted — a ~1e-3/element form delta
-// amplifies coherently through a 32-layer residual stream into ~4e-2 rel_l2 (measured). The erf
-// flavor's A&S 7.1.26 polynomial sits within f32 rounding of the CPU's double-precision erf.
+// amplifies coherently through a 32-layer residual stream into ~4e-2 rel_l2 (measured). The forms
+// live in dasllama_gpu_math, the CPU's own in f32, and both homes evaluate them.
 [never_inline]   // the auto-inliner would fold this back into `map`, breaking its value-position splice (single-return rule)
-def private msl_gelu_erf_form(a : float) : float {
-    let z = abs(a) * 0.7071067811865476
-    let tt = 1.0 / (1.0 + 0.3275911 * z)
-    let e = tt * (0.254829592 + tt * (-0.284496736 + tt * (1.421413741 + tt * (-1.453152027 + tt * 1.061405429)))) * exp(-z * z)
-    return 0.5 * a * (1.0 + (a >= 0.0 ? 1.0 - e : e - 1.0))
-}
+def private msl_gelu_erf_form(a : float) : float => gelu_erf_f32(a)
 
 [metal_dispatch(name = "enc_gelu_erf", pso = "g_pso_gelu_erf", tg = 64, grid = "total/64", params = "total : int64")]
 class MetalGeluErf : MetalEw1T {
@@ -5131,21 +5126,8 @@ class MetalGeluErf : MetalEw1T {
 }
 
 [never_inline]   // same single-return-splice protection as msl_gelu_erf_form
-def private msl_gelu_lut_form(a : float) : float {
-    if (a <= -10.0) {
-        return 0.0
-    }
-    if (a >= 10.0) {
-        return a
-    }
-    let xr = float(float16(a))
-    let gv = 0.5 * xr * (2.0 - 2.0 / (1.0 + exp(2.0 * (0.79788456080286535587989211986876 * xr * (1.0 + 0.044715 * xr * xr)))))
-    return float(float16(gv))
-}
+def private msl_gelu_lut_form(a : float) : float => gelu_tanh_lut_f32(a)
 
-// The fp16-LUT tanh GELU, form-matched to the CPU table: the +-10 clamps and BOTH f16 round-trips
-// run in kernel (RNE, same as the CPU table's domain), tanh via the exp identity (Metal tanh NaNs
-// past ~44; the clamped argument reaches 43.7). Near-bit-exact vs the CPU LUT by construction.
 [metal_dispatch(name = "enc_gelu_lut", pso = "g_pso_gelu_lut", tg = 64, grid = "total/64", params = "total : int64")]
 class MetalGeluLut : MetalEw1T {
     def override map(a : float) : float => msl_gelu_lut_form(a)
@@ -9825,15 +9807,8 @@ class MetalGegluHX : MetalEw2T {
     override ACT = 1
 }
 
-// GEGLU-quick (gemma4v): gelu_quick(g)*u with the CPU's f16-table form — both binary16
-// round-trips run in kernel (RNE), so the residual stream sees the same activation bits as the
-// CPU lane rather than the exact x*sigmoid(1.702x) (form-matched like the tower GELUs).
 [never_inline]   // the single-return-splice protection of msl_gelu_lut_form
-def private msl_gelu_quick_lut_form(a : float) : float {
-    let xr = float(float16(a))
-    let gv = xr * (1.0 / (1.0 + exp(-1.702 * xr)))
-    return float(float16(gv))
-}
+def private msl_gelu_quick_lut_form(a : float) : float => gelu_quick_lut_f32(a)
 
 [metal_dispatch(name = "enc_geglu_quick", pso = "g_pso_geglu_quick", tg = 64, grid = "total/64", params = "total : int64")]
 class MetalGegluQuick : MetalEw2T {

@@ -1909,9 +1909,8 @@ module) is independent and can land any time - it is pure structure.
     here, twice in the ASR decoder and eight times in the Metal driver (a `TowerEngage` in
     `dasllama_tower.das`); the three hand-rolled listener registries (`register_vk_drop_hook`,
     `register_weights_epoch_listener`, `register_reload_prep`) against daslib's `delegate` module; the
-    Vulkan dump rungs against their Metal twins; the two gelu-quick spellings (`x * (1/(1+exp(-1.702
-    x)))` and `x / (1+exp(-1.702 x))` round differently, so a fold moves one side's bits); and
-    `approx` in `test_metal_decode_kernels.das` against `_compares`.
+    Vulkan dump rungs against their Metal twins; and `approx` in `test_metal_decode_kernels.das` against
+    `_compares`.
 92. **The low-format N-row arc's review leftovers.** The kq kernel
     bodies write the per-format scale-row strides as literals (`wsb * 5u`, `* 8u`, `* 6u`, `* 10u`,
     `* 12u`, `* 40u + 32u`), which `REVIEW_KQ_FORMATS.md` wants read off `dasllama_kqformat.das`'s

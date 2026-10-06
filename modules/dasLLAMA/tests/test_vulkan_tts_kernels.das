@@ -8,6 +8,7 @@ require dastest/testing_boost public
 require ?vulkan vulkan
 require ?vulkan dasllama/dasllama_vulkan_common
 require ?vulkan dasllama/dasllama_vulkan_classes
+require dasllama/dasllama_gpu_math   // nolint:STYLE030,LINT019 - gelu_tanh_lut_f32, the GELU cell's oracle, inside the vulkan arm alone
 require ?vulkan _vkd_oracles
 require _compares   // nolint:STYLE030,LINT019 — the compares, inside the vulkan arms alone
 require _tts_kernel_oracles   // nolint:STYLE030,LINT019 — the in-test CPU forms the cells share, inside the vulkan arms alone
@@ -187,7 +188,7 @@ def test_vkt_gelu_tanh(t0 : T?) {
                 t |> success(outside_run(got, EL_OFF, EL_N, x), "tts_gelu_tanh: the elements outside the run are untouched")
                 var lut_off = 0
                 for (i in range(EL_OFF, EL_OFF + EL_N)) {
-                    if (!bar_ok(tower_gelu_tanh(x[i]), want[i], TTS_REL)) {
+                    if (!bar_ok(gelu_tanh_lut_f32(x[i]), want[i], TTS_REL)) {
                         lut_off++
                     }
                 }

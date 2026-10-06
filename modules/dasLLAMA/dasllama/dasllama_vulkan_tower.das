@@ -2758,8 +2758,7 @@ def private vt_aud_attach(var r : VtResident; t : AudioTower) : bool {
         g_vt_ln_offs[l] = enc_layer_offsets(t, l)
     }
     let lay = active_q8_repack_layout(g_active_needs_repack)
-    let lnp_rows = 2l * t.d_model
-    let rows_n = t.n_layer * t.layer_stride + lnp_rows
+    let rows_n = t.fblob.n - t.layers_off   //! the blocks' rows, the post-norm and the projector tail's f32 rows behind them
     let key = vt_key(t.qblob, t.qscales, t.fblob, t.layers_off, rows_n, 0l, t.n_layer, lay.mr, lay.kgroup, lay.wbias)
     if (r.key == key) {
         return true

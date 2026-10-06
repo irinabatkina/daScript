@@ -9940,8 +9940,7 @@ class TowerGeglu {
     def geglu(gv0, uv0 : float) : float {
         let gv = clamp(gv0, pa.glo, pa.ghi)
         let uv = clamp(uv0, pa.ulo, pa.uhi)
-        let a = gv * (1.0 / (1.0 + exp(-1.702 * gv)))
-        return clamp(a * uv, pa.dlo, pa.dhi)
+        return clamp(gelu_quick_lut_f32(gv) * uv, pa.dlo, pa.dhi)
     }
 
     [spirv_kernel(local_size_x = 256, name = "tower_geglu_cls_spv")]
@@ -10172,37 +10171,13 @@ struct TowerBiasArgs {
     act : uint
 }
 
-//! the tanh-LUT GELU (the vision towers, the whisper family) in the CPU form: the input and the output rounded through f16
-def tower_gelu_tanh(v : float) : float {
-    if (v <= -10.0) {
-        return 0.0
-    }
-    if (v >= 10.0) {
-        return v
-    }
-    let xr = float(float16(v))
-    let g = 0.5 * xr * (1.0 + tanh(0.79788456080286535587989211986876 * xr * (1.0 + 0.044715 * xr * xr)))
-    return float(float16(g))
-}
-
-//! the erf GELU, the CPU `gelu_erf`'s rational erfc in f32
-def tower_gelu_erf(v : float) : float {
-    let z = abs(v) * 0.7071067811865476
-    let t = 1.0 / (1.0 + 0.5 * z)
-    let erfc = t * exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 +
-        t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 +
-        t * (-0.82215223 + t * 0.17087277)))))))))
-    let half_v_erfc = 0.5 * v * erfc
-    return v >= 0.0 ? v - half_v_erfc : half_v_erfc
-}
-
 //! the tower activations by `TowerBiasArgs.act` code
 def tower_act(v : float; act : uint) : float {
     if (act == BIAS_ACT_NONE) {
         return v
     }
     if (act == BIAS_ACT_GELU_ERF) {
-        return tower_gelu_erf(v)
+        return gelu_erf_f32(v)
     }
     if (act == BIAS_ACT_SILU) {
         return silu_f32(v)
@@ -10210,7 +10185,7 @@ def tower_act(v : float; act : uint) : float {
     if (act == BIAS_ACT_RELU) {
         return max(v, 0.0)
     }
-    return tower_gelu_tanh(v)
+    return gelu_tanh_lut_f32(v)
 }
 
 struct TowerBiasRqArgs {
@@ -10229,7 +10204,7 @@ class TowerBiasActRq : RqT {
     @ssbo @binding = 3 outs : array<float>
     @push_constant pa : TowerBiasRqArgs
 
-    def override load1(e : uint) : float => tower_gelu_tanh(x[e] + wn[pa.boff + e % max(1u, pa.d)])
+    def override load1(e : uint) : float => gelu_tanh_lut_f32(x[e] + wn[pa.boff + e % max(1u, pa.d)])
 }
 
 //! a GEMM output's bias row added in place, then the activation `pa.act` names (`tower_act`); a stamp overriding `biased`

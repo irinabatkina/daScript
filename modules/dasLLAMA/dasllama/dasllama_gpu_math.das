@@ -44,6 +44,39 @@ def dn_decay(a, g : float) : float => exp(a * softplus(g))
 //! the CPU `gelu`'s tanh form in f32 (not the f16 LUT form the vision towers read), its tanh clamped by `tts_tanh`
 def tts_gelu_tanh(v : float) : float => 0.5 * v * (1.0 + tts_tanh(0.7978845608028654 * mad(0.044715 * v * v, v, v)))
 
+//! the erf GELU in the CPU `gelu_erf`'s form - the Numerical Recipes erfc - in f32, the one both homes evaluate
+def gelu_erf_f32(v : float) : float {
+    let z = abs(v) * 0.7071067811865476
+    let t = 1.0 / (1.0 + 0.5 * z)
+    let erfc = t * exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 +
+        t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 +
+        t * (-0.82215223 + t * 0.17087277)))))))))
+    let half_v_erfc = 0.5 * v * erfc
+    return v >= 0.0 ? v - half_v_erfc : half_v_erfc
+}
+
+//! the fp16-LUT tanh GELU in the CPU table's form (`gelu_tanh_lut`): the +-10 clamps and both f16 round trips in the kernel, the
+//! tanh through the exp identity (Metal's tanh NaNs past about 44; the clamped argument reaches 43.7)
+def gelu_tanh_lut_f32(v : float) : float {
+    if (v <= -10.0) {
+        return 0.0
+    }
+    if (v >= 10.0) {
+        return v
+    }
+    let xr = float(float16(v))
+    let gv = 0.5 * xr * (2.0 - 2.0 / (1.0 + exp(2.0 * (0.79788456080286535587989211986876 * xr * (1.0 + 0.044715 * xr * xr)))))
+    return float(float16(gv))
+}
+
+//! GELU-quick in the CPU table's form (`geglu_quick_lut_rows`): both f16 round trips in the kernel, so the residual stream sees the
+//! same activation bits as the CPU lane
+def gelu_quick_lut_f32(v : float) : float {
+    let xr = float(float16(v))
+    let gv = xr * (1.0 / (1.0 + exp(-1.702 * xr)))
+    return float(float16(gv))
+}
+
 //! A forward conv's source row for output row r at tap - (r0 + r) * stride + tap * dil - pad_l - or -1 off the input.
 def conv_src_fwd_row(r, tap, r0, pad_l, dil, stride, t_in : uint) : int {
     let st = int((r0 + r) * stride + tap * dil) - int(pad_l)
