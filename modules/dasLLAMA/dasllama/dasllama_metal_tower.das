@@ -626,7 +626,7 @@ struct private TwGpuCtx {
     u_totd : MetalBuffer?
     u_tot2d : MetalBuffer?
     u_totff : MetalBuffer?
-    u_half : MetalBuffer?
+    half : float          //!< the macaron half-step's residual scale
     mp : int64
     np64 : int64
     npos : int64
@@ -661,7 +661,7 @@ def private tw_ctx_make(var c : TwGpuCtx; blob : void?; blob_bytes : uint64; map
     c.u_totd = uniform_u32(uint(npos * d))
     c.u_tot2d = uniform_u32(uint(npos * 2l * d))
     c.u_totff = uniform_u32(uint(npos * n_ff))
-    c.u_half = uniform_f32(half)
+    c.half = half
 }
 
 def private tw_ctx_release(var c : TwGpuCtx) {
@@ -682,7 +682,6 @@ def private tw_ctx_release(var c : TwGpuCtx) {
     pool_release(g_upool, c.u_totd, 4ul)
     pool_release(g_upool, c.u_tot2d, 4ul)
     pool_release(g_upool, c.u_totff, 4ul)
-    pool_release(g_upool, c.u_half, 4ul)
 }
 
 struct private G4aGpuCtx : TwGpuCtx {
@@ -817,7 +816,7 @@ def private g4a_blocks_body(enc : MetalComputeEncoder?; t : Gemma4aEncoder; c : 
         enc_g4a_silu(enc, c.bh, 0ul, c.u_totff, npos * ff)
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_ff_down, rb + 16ul, c.bh, c.bxc, c.bxb, lo.ff_down, c.u_in, c.u_out, c.u_ff, c.u_d, c.u_totff, c.u_totd, npos * ff, npos * d, mp, d)
         pf_enc_rms(enc, c.bxb, 0ul, bw_ffp, c.bxb, c.u_d, c.u_eps, npos)
-        enc_g4a_axpy(enc, c.bx, c.bxb, c.u_totd, c.u_half, npos * d)
+        enc_g4a_axpy(enc, c.bx, c.bxb, GkAxpyArgs(nelem = uint(npos * d), scale = c.half, zero = 0u), npos * d)
         pf_enc_rms(enc, c.bx, 0ul, bw_apre, c.bxb, c.u_d, c.u_eps, npos)
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_q, rb + 32ul, c.bxb, c.bxc, c.bq, lo.q, c.u_in, c.u_out, c.u_d, c.u_d, c.u_totd, c.u_totd, npos * d, npos * d, mp, d)
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_k, rb + 48ul, c.bxb, c.bxc, c.bk, lo.k, c.u_in, c.u_out, c.u_d, c.u_d, c.u_totd, c.u_totd, npos * d, npos * d, mp, d)
@@ -830,7 +829,7 @@ def private g4a_blocks_body(enc : MetalComputeEncoder?; t : Gemma4aEncoder; c : 
         pf_enc_rms(enc, c.bx, 0ul, bw_ncv, c.bxb, c.u_d, c.u_eps, npos)
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_pw1, rb + 96ul, c.bxb, c.bxc, c.bh, lo.conv_pw1, c.u_in, c.u_out, c.u_d, c.u_2d, c.u_totd, c.u_tot2d, npos * d, npos * 2l * d, mp, 2l * d)
         enc_g4a_glu(enc, c.bh, c.bglu, c.u_d, c.u_totd, npos * d)
-        enc_g4a_dw(enc, c.bglu, c.bcvd, c.bblob, uint64(lo.conv_dw * 4l), c.u_d, c.u_totd, npos * d)
+        enc_g4a_dw(enc, c.bglu, c.bcvd, c.bblob, GkDwConvRowsArgs(c = uint(d), t_in = uint(npos), woff = uint(lo.conv_dw)), npos * d)
         pf_enc_rms(enc, c.bcvd, 0ul, bw_cvn, c.bcvd, c.u_d, c.u_eps, npos)
         enc_g4a_silu(enc, c.bcvd, 0ul, c.u_totd, npos * d)
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_pw2, rb + 112ul, c.bcvd, c.bxc, c.bxb, lo.conv_pw2, c.u_in, c.u_out, c.u_d, c.u_d, c.u_totd, c.u_totd, npos * d, npos * d, mp, d)
@@ -840,7 +839,7 @@ def private g4a_blocks_body(enc : MetalComputeEncoder?; t : Gemma4aEncoder; c : 
         enc_g4a_silu(enc, c.bh, 0ul, c.u_totff, npos * ff)
         g4a_mm_site(enc, c.bblob, c.bbounds, lo.c_ff_down_1, rb + 144ul, c.bh, c.bxc, c.bxb, lo.ff_down_1, c.u_in, c.u_out, c.u_ff, c.u_d, c.u_totff, c.u_totd, npos * ff, npos * d, mp, d)
         pf_enc_rms(enc, c.bxb, 0ul, bw_ffp1, c.bxb, c.u_d, c.u_eps, npos)
-        enc_g4a_axpy(enc, c.bx, c.bxb, c.u_totd, c.u_half, npos * d)
+        enc_g4a_axpy(enc, c.bx, c.bxb, GkAxpyArgs(nelem = uint(npos * d), scale = c.half, zero = 0u), npos * d)
         pf_enc_rms(enc, c.bx, 0ul, bw_ln2, c.bx, c.u_d, c.u_eps, npos)
     }
 }
@@ -914,8 +913,7 @@ let private FC_MAX_HEADS = 16   //!< the per-head uniform seats; the shape gate 
 //! The FastConformer driver's shared GPU context (canary and parakeet) - g4a's shape with the rel table in place of the windowed RPE, and no clamp records.
 struct private FcGpuCtx : TwGpuCtx {
     bposl : MetalBuffer?
-    u_nk : MetalBuffer?
-    u_np : MetalBuffer?
+    nk : int64            //!< the conv module's depthwise taps
     ka : FcAttnArgs
     wwp : int64
     ww : int64
@@ -1022,8 +1020,7 @@ def private fc_ctx_make(blob : PlaneF; mapped : bool; d, n_ff, n_head, nk : int6
         npos, d, n_ff, eps, 0.5, uint64(c.wwp * d * 4l))
     c.bposl = tw_take(c.scratch, c.bytes_pos)
     upload_rows_padded(c.bpos, unsafe(addr<void?>(pos_emb[0])), ww, c.wwp, d)   // the sinusoidal rel table, zero-padded to the GEMM's row floor
-    c.u_nk = uniform_u32(uint(nk))
-    c.u_np = uniform_u32(uint(npos))
+    c.nk = nk
     c.ka = fc_attn_args(d, dh, npos)
     c.dev_on = fc_dev_attach(c, d)
     if (!c.dev_on) {
@@ -1055,8 +1052,6 @@ def private fc_ctx_make(blob : PlaneF; mapped : bool; d, n_ff, n_head, nk : int6
 }
 
 def private fc_ctx_release(var c : FcGpuCtx) {
-    pool_release(g_upool, c.u_nk, 4ul)
-    pool_release(g_upool, c.u_np, 4ul)
     tw_release(c.scratch)
     if (!c.dev_on) {
         for (h in range64(c.n_head)) {
@@ -1106,7 +1101,7 @@ def private fc_block(enc : MetalComputeEncoder?; c : FcGpuCtx; lo : CanaryLayerO
     enc_g4a_silu(enc, c.bh, 0ul, c.u_totff, npos * ff)
     fc_mm(enc, c, lo.ff1b_w, c.bh, c.bxb, c.u_ff, c.u_d, mp, d, ff)
     fc_bias(enc, c, c.bxb, lo.ff1b_b, c.u_d, c.u_totd, npos * d)
-    enc_g4a_axpy(enc, c.bx, c.bxb, c.u_totd, c.u_half, npos * d)
+    enc_g4a_axpy(enc, c.bx, c.bxb, GkAxpyArgs(nelem = uint(npos * d), scale = c.half, zero = 0u), npos * d)
     enc_ln(enc, c.bx, c.bblob, uint64(lo.nat_w * 4l), c.bblob, uint64(lo.nat_b * 4l), c.bxb, 0ul, c.u_d, c.u_eps, npos)
     fc_mm(enc, c, lo.q_w, c.bxb, c.bq, c.u_d, c.u_d, mp, d, d)
     fc_bias(enc, c, c.bq, lo.q_b, c.u_d, c.u_totd, npos * d)
@@ -1123,12 +1118,11 @@ def private fc_block(enc : MetalComputeEncoder?; c : FcGpuCtx; lo : CanaryLayerO
     fc_mm(enc, c, lo.pw1_w, c.bxb, c.bh, c.u_d, c.u_2d, mp, 2l * d, d)
     fc_bias(enc, c, c.bh, lo.pw1_b, c.u_2d, c.u_tot2d, npos * 2l * d)
     enc_g4a_glu(enc, c.bh, c.bglu, c.u_d, c.u_totd, npos * d)
+    var dwa = GkDwConvRowsArgs(c = uint(d), k = uint(c.nk), t_in = uint(npos), woff = uint(lo.dw_w), bnwoff = uint(lo.bn_w), bnboff = uint(lo.bn_b))   //! the args seat wants a non-ref value
     if (c.tap_major) {
-        enc_pk_dw(enc, c.bglu, c.bcvd, c.bblob, uint64(lo.dw_w * 4l), c.bblob, uint64(lo.bn_w * 4l),
-            c.bblob, uint64(lo.bn_b * 4l), c.u_d, c.u_nk, c.u_np, c.u_totd, npos * d)
+        enc_pk_dw(enc, c.bglu, c.bcvd, c.bblob, dwa, npos * d)
     } else {
-        enc_cn_dw(enc, c.bglu, c.bcvd, c.bblob, uint64(lo.dw_w * 4l), c.bblob, uint64(lo.bn_w * 4l),
-            c.bblob, uint64(lo.bn_b * 4l), c.u_d, c.u_nk, c.u_np, c.u_totd, npos * d)
+        enc_cn_dw(enc, c.bglu, c.bcvd, c.bblob, dwa, npos * d)
     }
     fc_mm(enc, c, lo.pw2_w, c.bcvd, c.bxb, c.u_d, c.u_d, mp, d, d)
     fc_bias(enc, c, c.bxb, lo.pw2_b, c.u_d, c.u_totd, npos * d)
@@ -1139,7 +1133,7 @@ def private fc_block(enc : MetalComputeEncoder?; c : FcGpuCtx; lo : CanaryLayerO
     enc_g4a_silu(enc, c.bh, 0ul, c.u_totff, npos * ff)
     fc_mm(enc, c, lo.ff2b_w, c.bh, c.bxb, c.u_ff, c.u_d, mp, d, ff)
     fc_bias(enc, c, c.bxb, lo.ff2b_b, c.u_d, c.u_totd, npos * d)
-    enc_g4a_axpy(enc, c.bx, c.bxb, c.u_totd, c.u_half, npos * d)
+    enc_g4a_axpy(enc, c.bx, c.bxb, GkAxpyArgs(nelem = uint(npos * d), scale = c.half, zero = 0u), npos * d)
     enc_ln(enc, c.bx, c.bblob, uint64(lo.nout_w * 4l), c.bblob, uint64(lo.nout_b * 4l), c.bx, 0ul, c.u_d, c.u_eps, npos)
 }
 

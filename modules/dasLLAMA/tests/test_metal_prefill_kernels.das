@@ -699,23 +699,73 @@ def private fc_dw_gate(t : T?; var dev, queue; tap_major : bool) {
             }
         }
         let bx = mc |> in_(xv)
-        let bw = mc |> in_(wv)
-        let bbnw = mc |> in_(bnw)
-        let bbnb = mc |> in_(bnb)
+        var inscope wn <- clone_to_move(wv)   // the taps, the folded scale and the folded shift as one weight plane at element offsets
+        wn |> push_from(bnw)
+        wn |> push_from(bnb)
+        let bwn = mc |> in_(wn)
         let by = mc |> out_words(np * d, -1.0e30)
         let total = np * d
-        let bu_d = mc |> in_plain([uint(d)])
-        let bu_nk = mc |> in_plain([uint(nk)])
-        let bu_np = mc |> in_plain([uint(np)])
-        let bu_tot = mc |> in_plain([uint(total)])
+        var ka = GkDwConvRowsArgs(c = uint(d), k = uint(nk), t_in = uint(np), woff = 0u, bnwoff = uint(d * nk), bnboff = uint(d * nk + d))
+        for (leg in range(2)) {
+            if (leg == 1) {
+                wn[5 * nk + 3] += 2.0
+                mc |> plane_upload(bwn, wn)
+            }
+            let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
+                invoke(kd.enc, enc, pso, mc.buf[bx], mc.buf[by], mc.buf[bwn], ka, int64(total))
+            }
+            return if (!ran)
+            if (leg == 0) {
+                check_buf(t, tag, mc.buf[by], want, Bar(rel = 1e-5, abs_floor = 1e-6, poison_scaled = true), Shape(row_width = d))
+            } else {
+                t |> success(mc |> rerun_mismatches(by, want, 1e-5, 1e-6, "{tag} poison (MUST mismatch)") > 0,
+                    "{tag}: a poisoned tap reds the bars")
+            }
+        }
+    }
+}
+
+//! gemma4a's causal depthwise conv (the shared template's FORM 1 at five taps) against the CPU loop over 13 rows of 32
+//! channels: a row reads the four rows before it and nothing before the start. Bar: five f16-exact products summed in
+//! f32 against the same order; a poisoned tap must red it.
+def private g4a_dw_gate(t : T?; var dev, queue) {
+    let tag = "g4a_dw"
+    with_metal_cell(dev, queue) $(var mc : MetalCell) {
+        var err : string
+        let kd = kernel_of(@@enc_g4a_dw)
+        var pso = mc |> keep_stamp(kd, err)
+        return if (!pso_ok(t, tag, pso, err))
+        let np = 13
+        let d = 32
+        let nk = 5
+        var inscope xv <- f16_fill(np * d, 5, 0.09, -1.7)
+        var inscope wv <- f16_fill(d * nk, 7, 0.06, -0.8)
+        var inscope want : array<float>
+        want |> resize(np * d)
+        for (tt in range(np)) {
+            for (c in range(d)) {
+                var acc = 0.0
+                for (kk in range(nk)) {
+                    let src = tt + kk - (nk - 1)
+                    if (src >= 0) {
+                        acc += wv[c * nk + kk] * xv[src * d + c]
+                    }
+                }
+                want[tt * d + c] = acc
+            }
+        }
+        let bx = mc |> in_(xv)
+        let bwn = mc |> in_(wv)
+        let by = mc |> out_words(np * d, -1.0e30)
+        let total = np * d
+        var ka = GkDwConvRowsArgs(c = uint(d), t_in = uint(np), woff = 0u)
         for (leg in range(2)) {
             if (leg == 1) {
                 wv[5 * nk + 3] += 2.0
-                mc |> plane_upload(bw, wv)
+                mc |> plane_upload(bwn, wv)
             }
             let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
-                invoke(kd.enc, enc, pso, mc.buf[bx], mc.buf[by], mc.buf[bw], 0ul, mc.buf[bbnw], 0ul, mc.buf[bbnb], 0ul,
-                    mc.buf[bu_d], mc.buf[bu_nk], mc.buf[bu_np], mc.buf[bu_tot], int64(total))
+                invoke(kd.enc, enc, pso, mc.buf[bx], mc.buf[by], mc.buf[bwn], ka, int64(total))
             }
             return if (!ran)
             if (leg == 0) {
@@ -2959,6 +3009,7 @@ def test_metal_prefill_kernels(t : T?) {
                 fc_row_gate(t, dev, queue, 300, true)
                 fc_dw_gate(t, dev, queue, false)
                 fc_dw_gate(t, dev, queue, true)
+                g4a_dw_gate(t, dev, queue)
                 pk_front_conv_gate(t, dev, queue, true)
                 pk_front_conv_gate(t, dev, queue, false)
                 pk_xf_gate(t, dev, queue)

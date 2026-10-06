@@ -519,13 +519,14 @@ struct GkDwConvRowsArgs {
     bnboff : uint  //! the centered stamp's folded BatchNorm shift row in wn
 }
 
-//! a depthwise conv on rows, y [t_out][c] from x [t_in][c] and w [c][k], one element an invocation; FORM is the source rule
-//! and the epilogue: 0 the transposed conv gathered, bias first and one mad a tap (the CPU `conv1d_rows_transposed_depthwise`);
-//! 1 the causal conv, a row reading the k - 1 rows before it (gemma4a); 2 the centered conv, folded BatchNorm and silu after it (canary)
+//! a depthwise conv on rows, y [t_out][c] from x [t_in][c] and w [c][k] (w [k][c] under TAP_MAJOR, parakeet's load-time repack), one
+//! element an invocation; FORM is the source rule and the epilogue: 0 the transposed conv gathered, bias first and one mad a tap (the CPU
+//! `conv1d_rows_transposed_depthwise`); 1 the causal conv, a row reading the k - 1 rows before it (gemma4a); 2 the centered conv, folded BatchNorm and silu after it
 [ |> template_struct_instance]
 class template GkDwConvRows {
     @template_constant FORM : int = 0   //!< spelled as its literal: a template constant folds only a literal
     @template_constant K : uint = 0u    //!< the taps where the stamp fixes them, else 0 and the taps are `pa.k`
+    @template_constant TAP_MAJOR : bool = false
     @ssbo @binding = 0 @role = "read" x : array<float>
     @ssbo @binding = 1 @role = "write" y : array<float>
     @ssbo @binding = 2 @role = "weight" wn : array<float>
@@ -559,6 +560,14 @@ class template GkDwConvRows {
         }
     }
 
+    def tap(j, kk, nk : uint) : float {
+        static_if (TAP_MAJOR) {
+            return wn[pa.woff + kk * pa.c + j]
+        } else {
+            return wn[pa.woff + j * nk + kk]
+        }
+    }
+
     def dw_conv_rows_body {
         let e = gl_GlobalInvocationID.x
         if (e < rows_out() * pa.c) {
@@ -575,9 +584,9 @@ class template GkDwConvRows {
                 let src = src_row(t, kk)
                 if (src >= 0) {
                     static_if (FORM == 0) {
-                        acc = mad(wn[pa.woff + j * nk + kk], x[uint(src) * pa.c + j], acc)
+                        acc = mad(tap(j, kk, nk), x[uint(src) * pa.c + j], acc)
                     } else {
-                        acc += wn[pa.woff + j * nk + kk] * x[uint(src) * pa.c + j]
+                        acc += tap(j, kk, nk) * x[uint(src) * pa.c + j]
                     }
                 }
                 kk++

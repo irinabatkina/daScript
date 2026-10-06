@@ -3726,33 +3726,15 @@ class MetalG4aGlu {
     }
 }
 
-//! The gemma4a causal depthwise conv (k = 5, taps [d x 5] in the blob): one thread per element,
-//! rows before the window's reach read nothing (zero left context — chunk starts cold).
+//! The gemma4a causal depthwise conv, k = 5, on the template both homes stamp (the chunk's first rows read nothing before the start)
 [metal_dispatch(name = "enc_g4a_dw", pso = "g_pf_pso_g4a_dw", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalG4aDw {
-    @ssbo @binding = 0 @role = "read" x : array<float>      //!< [npos x d] GLU output
-    @ssbo @binding = 1 @role = "write" y : array<float>     //!< [npos x d]
-    @ssbo @binding = 2 @role = "weight" @off = "woff" w : array<float>   //!< [d x 5] causal taps
-    @uniform @binding = 3 d : uint
-    @uniform @binding = 4 total : uint      //!< grid guard: npos * d
+class MetalG4aDw : GkDwConvRows {
+    override FORM = 1
+    override K = 5u
 
     [metal_kernel(name="metal_g4a_dw_msl")]
     def metal_g4a_dw {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        let t = gid / d
-        let c = gid % d
-        var acc = 0.0
-        var kk = 0u
-        while (kk < 5u) {
-            if (t + kk >= 4u) {   //! src = t - 4 + kk >= 0 in unsigned form
-                acc += w[c * 5u + kk] * x[(t + kk - 4u) * d + c]
-            }
-            kk++
-        }
-        y[gid] = acc
+        dw_conv_rows_body()
     }
 }
 
@@ -4025,67 +4007,26 @@ class MetalFcUnpack {
     }
 }
 
-//! The FastConformer conv module's depthwise k=9 CENTERED conv over time + the folded BatchNorm
-//! (bn_w/bn_b carry the fold) + SiLU — one kernel, the CPU loop's exact form. The stamp axis is
-//! the tap layout: canary's channel-major [d x nk], parakeet's load-time tap-major [nk x d].
-[ |> template_struct_instance]
-class template MetalCnDwT {
-    @ssbo @binding = 0 @role = "read" x : array<float>      //!< [npos x d] GLU output
-    @ssbo @binding = 1 @role = "write" y : array<float>     //!< [npos x d]
-    @ssbo @binding = 2 @role = "weight" @off = "woff" w : array<float>     //!< [d x nk] taps, or [nk x d] under TAP_MAJOR
-    @ssbo @binding = 3 @role = "weight" @off = "bnwoff" bnw : array<float> //!< [d] folded BN scale
-    @ssbo @binding = 4 @role = "weight" @off = "bnboff" bnb : array<float> //!< [d] folded BN shift
-    @uniform @binding = 5 d : uint
-    @uniform @binding = 6 nk : uint         //!< taps (odd; 9 on both families)
-    @uniform @binding = 7 npos : uint
-    @uniform @binding = 8 total : uint      //!< grid guard: npos * d
-    @template_constant TAP_MAJOR : bool = false
-
-    def tap(c, kk : uint) : float {
-        static_if (TAP_MAJOR) {
-            return w[kk * d + c]
-        } else {
-            return w[c * nk + kk]
-        }
-    }
-
-    def dw_body {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        let t = gid / d
-        let c = gid % d
-        let kpad = (nk - 1u) / 2u
-        var acc = 0.0
-        var kk = 0u
-        while (kk < nk) {
-            let src = t + kk   //! src row = t + kk - kpad, guarded in unsigned form
-            if (src >= kpad && src - kpad < npos) {
-                acc += tap(c, kk) * x[(src - kpad) * d + c]
-            }
-            kk++
-        }
-        let bv2 = acc * bnw[c] + bnb[c]
-        y[gid] = bv2 / (1.0 + exp(-bv2))
-    }
-}
-
+//! The FastConformer conv module's centered depthwise conv with the folded BatchNorm and SiLU, on the template both homes
+//! stamp: canary's channel-major taps, and parakeet's load-time tap-major ones under TAP_MAJOR
 [metal_dispatch(name = "enc_cn_dw", pso = "g_pf_pso_cn_dw", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalCnDw : MetalCnDwT {
+class MetalCnDw : GkDwConvRows {
+    override FORM = 2
+
     [metal_kernel(name="metal_cn_dw_msl")]
     def metal_cn_dw {
-        dw_body()
+        dw_conv_rows_body()
     }
 }
 
 [metal_dispatch(name = "enc_pk_dw", pso = "g_pf_pso_pk_dw", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalPkDw : MetalCnDwT {
+class MetalPkDw : GkDwConvRows {
+    override FORM = 2
     override TAP_MAJOR = true
 
     [metal_kernel(name="metal_pk_dw_msl")]
     def metal_pk_dw {
-        dw_body()
+        dw_conv_rows_body()
     }
 }
 
@@ -4542,21 +4483,12 @@ class MetalQ3aFinish {
     }
 }
 
-//! Scaled residual add g += u * ascale — the macaron half-step (enc_add's form is (g+u)*scale).
-[metal_dispatch(name = "enc_g4a_axpy", pso = "g_pf_pso_g4a_axpy", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalG4aAxpy {
-    @ssbo @binding = 0 @role = "readwrite" g : array<float>
-    @ssbo @binding = 1 @role = "read" u : array<float>
-    @uniform @binding = 2 total : uint      //!< grid guard
-    @uniform @binding = 3 ascale : float
-
+//! The macaron half-step's scaled residual add, g += u * scale, on the axpy template both homes stamp
+[metal_dispatch(name = "enc_g4a_axpy", pso = "g_pf_pso_g4a_axpy", tg = 64, grid = "nelem/64", params = "nelem : int64")]
+class MetalG4aAxpy : GkAxpy {
     [metal_kernel(name="metal_g4a_axpy_msl")]
     def metal_g4a_axpy {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        g[gid] += u[gid] * ascale
+        axpy_body()
     }
 }
 
