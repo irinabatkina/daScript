@@ -747,7 +747,7 @@ zeroed from the middle block on, through the device chain, must
 EXCEED the bar): `test_encoder_blocks_vulkan` (qwen2audio, voxtral, omni-3b over the synthetic mel
 of the Metal blocks cell), `test_gemma4a_vulkan_twin` (the E2B audio encoder over jfk through
 `gemma4a_encode_all`) and `test_canary_vulkan_twin` (the canary encoder over jfk's log-mel through
-`canary_encode`), the last two also holding the bar on a second, longer encode after a short one on
+`canary_encode`) and `test_parakeet_vulkan_twin` (parakeet over jfk through `parakeet_encode`), the canary and gemma4a ones also holding the bar on a second, longer encode after a short one on
 the same residency (the scratch regrown under it) and on a fresh residency after a shutdown, and
 both running their fronts on the device (gemma4a's whole chunk, canary's front) beside the blocks,
 so the bar covers the front chains too - the front counter (`convs`) asserted beside the block
@@ -1818,12 +1818,16 @@ CPU mel (the seat's GEMMs on the exact f32 tiles: a half tile reads a quiet bin 
 counter (`metal_tower_mel_encodes`) up by the device leg alone, an 80-mel call off the seat's
 lattice served by the CPU with the counter unmoved, another clip's mel outside the bar; the Vulkan twins
 `test_encoder_blocks_vulkan`, `test_gemma4a_vulkan_twin`, `test_canary_vulkan_twin` and
-`test_qwen3a_vulkan_front` (the three-way cells described under `test_vulkan_tower_kernels.das`); and
-`test_encoder_tail_vulkan`, the projector tail alone on the Vulkan chain, one cell a projector kind on the
-q8 tower minted in memory (the device tail against the CPU tail over the SAME device block rows,
-`set_vulkan_tower_tail` off for the CPU-tail leg and put back, within 1e-2 rel-l2, the tail counter
-`vulkan_tower_tail_encodes` up on the device leg alone with the blocks on the device on both, another mel's
-rows outside the bar as the control), all of which skip without their carriers (the qwen2audio / voxtral / omni-3b f32 mmprojs, the E2B bf16
+`test_qwen3a_vulkan_front` (the three-way cells described under `test_vulkan_tower_kernels.das`),
+`test_parakeet_vulkan_twin` (parakeet-TDT 0.6B v2 over jfk through `parakeet_encode` - the front and the blocks on the
+device, the same three-way bar, counters and poison as the canary twin, the q8 and exact models minted in memory
+through `stage_parakeet_model`); and
+`test_encoder_tail_vulkan`, the projector tail alone on the Vulkan chain, one cell a projector kind, three ways
+over the SAME device block rows (the f32 tail of the exact tower over those rows the reference, the CPU q8
+tail with `set_vulkan_tower_tail` off and the device tail with it on, the lever put back; the device within
+`TWIN_SLACK_VK` x the CPU q8 tail's own distance plus the twin floor - the CPU tail quantizes the normed rows to
+Q8_0 blocks where the device feeds f16), the tail counter `vulkan_tower_tail_encodes` up on the device leg
+alone with the blocks on the device on both, another mel's rows outside the bar as the control, all of which skip without their carriers (the qwen2audio / voxtral / omni-3b f32 mmprojs, the E2B bf16
 mmproj, the canary f32 encoder, the Qwen3-ASR bf16 mmproj), without jfk.wav, without a Vulkan
 device under `DASLLAMA_GPU=1`, and on a das_metal build.
 `test_whisper.das` - stocked suite; model-gated: the whisper/parakeet/canary/gemma4a/omni

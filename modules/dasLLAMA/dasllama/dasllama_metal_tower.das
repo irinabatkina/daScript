@@ -1348,21 +1348,6 @@ def private metal_canary_front(t : CanaryEncoder; var st : CanaryState) : int64 
 }
 
 //! Parakeet's block offsets in the shared chain's layout: the same regions, no GEMM biases (-1).
-def private pk_fc_layer(lo : PkLayerOffs) : CanaryLayerOffs {
-    return CanaryLayerOffs(nf1_w = lo.nf1_w, nf1_b = lo.nf1_b,
-        ff1a_w = lo.ff1a_w, ff1a_b = -1l, ff1b_w = lo.ff1b_w, ff1b_b = -1l,
-        nat_w = lo.nat_w, nat_b = lo.nat_b,
-        q_w = lo.q_w, q_b = -1l, k_w = lo.k_w, k_b = -1l, v_w = lo.v_w, v_b = -1l, o_w = lo.o_w, o_b = -1l,
-        pos_w = lo.pos_w, bias_u = lo.bias_u, bias_v = lo.bias_v,
-        ncv_w = lo.ncv_w, ncv_b = lo.ncv_b,
-        pw1_w = lo.pw1_w, pw1_b = -1l, dw_w = lo.dw_w, dw_b = -1l,
-        bn_w = lo.bn_w, bn_b = lo.bn_b, bn_mean = lo.bn_mean, bn_var = lo.bn_var,
-        pw2_w = lo.pw2_w, pw2_b = -1l,
-        nf2_w = lo.nf2_w, nf2_b = lo.nf2_b,
-        ff2a_w = lo.ff2a_w, ff2a_b = -1l, ff2b_w = lo.ff2b_w, ff2b_b = -1l,
-        nout_w = lo.nout_w, nout_b = lo.nout_b)
-}
-
 [hot_path]
 def private metal_parakeet_blocks(t : ParakeetModel; var st : ParakeetState; npos, ww : int64) : bool {
     if (!g_tw_env_tower) {

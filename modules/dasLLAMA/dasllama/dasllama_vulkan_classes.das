@@ -9549,6 +9549,17 @@ class TowerDwConv : GkDwConv2d {
     }
 }
 
+//! parakeet's subsample depthwise conv2d: the same stamp over tap-major taps
+[vk_dispatch(name = "tower_pk_dw2d_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
+class TowerPkDwConv2d : GkDwConv2d {
+    override TAP_MAJOR = true
+
+    [spirv_kernel(local_size_x = 256, name = "tower_pk_dw2d_cls_spv")]
+    def run {
+        dw_conv2d_body()
+    }
+}
+
 //! the Transformer-XL rel-position table, on the template both homes stamp
 [vk_dispatch(name = "tower_rel_sincos_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
 class TowerRelSinCos : GkRelSinCos {
@@ -9896,6 +9907,18 @@ class TowerCnDw : GkDwConvRows {
     }
 }
 
+//! parakeet's conv module tail: the same centered conv with the folded BatchNorm over tap-major taps
+[vk_dispatch(name = "tower_pk_dw_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
+class TowerPkDw : GkDwConvRows {
+    override FORM = 2
+    override TAP_MAJOR = true
+
+    [spirv_kernel(local_size_x = 256)]
+    def run {
+        dw_conv_rows_body()
+    }
+}
+
 struct TowerGegluArgs {
     nelem : uint    //! a 4-multiple
     glo : float     //! the gate GEMM's output bounds
@@ -10077,6 +10100,12 @@ class template TowerPostAddLnT : WgReduceBase {
 
 [vk_dispatch(name = "tower_post_add_ln_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
 class TowerPostAddLn : TowerPostAddLnT {}
+
+//! the seam of a block whose GEMMs carry no bias row (parakeet): the branch added bare, the next layernorm behind it
+[vk_dispatch(name = "tower_post_add_ln_nb_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
+class TowerPostAddLnNb : TowerPostAddLnT {
+    override BIAS = false
+}
 
 [vk_dispatch(name = "tower_post_add_ln16_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
 class TowerPostAddLn16 : TowerPostAddLnT {

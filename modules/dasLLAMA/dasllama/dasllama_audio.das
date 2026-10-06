@@ -1681,6 +1681,15 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     }
     trace_tag(TRACE_TAG_ENC_PROJ)
     let t_tail = ref_time_ticks()
+    audio_projector_tail(t, s)
+    asr_prof_add("enc.tail", t_tail)
+    trace_tag(0)   // clear: the decoder's dispatches must not inherit the projector's color
+    diff_stage("out", s.out, rows * t.proj_dim)
+}
+
+//! the projector tail over the blocks' rows in `s.x`, by kind, into `s.out` - the specification the GPU tails mirror
+def audio_projector_tail(t : AudioTower; var s : EncoderState) {
+    let rows = audio_tokens_per_chunk(t)
     let tt = t.n_ctx
     let d = t.d_model
 
@@ -1719,7 +1728,4 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
         gelu_erf(s.ph, rows * t.mm1_out)
         tw_mm_rq(t, s.out, t.mm2_w_off, s.ph, s.xqi, s.xsi, t.mm1_out, t.proj_dim, rows)
     }
-    asr_prof_add("enc.tail", t_tail)
-    trace_tag(0)   // clear: the decoder's dispatches must not inherit the projector's color
-    diff_stage("out", s.out, rows * t.proj_dim)
 }

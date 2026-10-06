@@ -50,10 +50,10 @@ and 72 is off every fragment lattice. Per family, both drivers:
 
 ### The Vulkan tower driver's encode chains {#vk-tower-encode-chains}
 
-`dasllama_vulkan_tower.das` fills the gemma4v, gemma3v, qwen3v and qwen25v hook slots, the three
+`dasllama_vulkan_tower.das` fills the gemma4v, gemma3v, qwen3v and qwen25v hook slots, the four
 audio blocks seats - the whisper-class block loop (`register_tower_blocks_gpu`), gemma4a's
-(`register_gemma4a_gpu`) and canary's (`register_canary_gpu`) - and the audio front seats
-(qwen3a's mel and conv front, gemma4a's whole chunk, canary's front;
+(`register_gemma4a_gpu`), canary's (`register_canary_gpu`) and parakeet's (`register_parakeet_gpu`) - and the audio
+front seats (qwen3a's mel and conv front, gemma4a's whole chunk, canary's front, parakeet's whole encode;
 `ARCHITECTURE_MEDIA.md#tower-gpu-hook`) on a build without das_metal (the Metal driver owns them there). Each
 blocks chain is the Metal encode chain's shape (`ARCHITECTURE_GPU_TOWER.md#tower-encode-chains`): one command buffer per encode walks the blocks dispatch for dispatch
 as the family's CPU loop does, the CPU loop is the specification, and the residual stream comes
@@ -64,18 +64,16 @@ input projection in one command buffer, so the blocks chain reads the residual r
 and the tail (the projector, the post-norm) stays on the CPU except where a bullet below says
 the chain runs it (the projector tails of gemma4a and of the chat towers). Where a chain and its family part on the seat:
 
-- **gemma4v** serves the hook after the CPU stem, whole. **gemma3v**'s hook fires before the CPU
-  stem (the Metal driver runs the stem itself), so `gemma3v_encode` finishes the stem on the CPU
-  first when the tower is q8 and the driver serves the blocks alone. **qwen3v**'s hook is
-  exact-lane and whole-chain (Metal's), so the driver takes the blocks-only q8 seat
-  (`register_qwen3v_gpu_blocks`): after each deepstack tap block the residual is copied on the device
-  into a stash read back beside x, and the tap mergers run on the CPU off those rows, a tap past
-  a truncated tower's blocks skipped as the CPU loop skips it. **qwen25v** has no q8 lane, so its
-  blocks-only seat (`register_qwen25v_gpu_blocks`) runs after the CPU stem and before the CPU
-  tail over the baked halfword twin through the f16 GEMM class; a bf16-sourced twin declines. Its
-  gated hidden, silu(g + bg) . (u + bu), runs on the LLM's biased f16 act stamp (`ActF16B`) at a
-  zero row map (`rex_dev`: every row the one expert), with the norms plane bound as both bias
-  planes, so the halves the down GEMM reads land in one dispatch.
+- **gemma4v** serves the hook after the CPU stem, whole. **gemma3v**'s hook fires before the CPU stem (the Metal
+  driver runs the stem itself), so `gemma3v_encode` finishes the stem on the CPU first when the tower is q8 and the
+  driver serves the blocks alone. **qwen3v**'s hook is exact-lane and whole-chain (Metal's), so the driver takes the
+  blocks-only q8 seat (`register_qwen3v_gpu_blocks`): after each deepstack tap block the residual is copied on the
+  device into a stash read back beside x, and the tap mergers run on the CPU off those rows, a tap past a truncated
+  tower's blocks skipped as the CPU loop skips it. **qwen25v** has no q8 lane, so its blocks-only seat
+  (`register_qwen25v_gpu_blocks`) runs after the CPU stem and before the CPU tail over the baked halfword twin
+  through the f16 GEMM class; a bf16-sourced twin declines. Its gated hidden, silu(g + bg) . (u + bu), runs on the
+  LLM's biased f16 act stamp (`ActF16B`) at a zero row map (`rex_dev`: every row the one expert), with the norms
+  plane bound as both bias planes, so the halves the down GEMM reads land in one dispatch.
 - **The whisper-class towers** (whisper, qwen2audio, voxtral, ultravox, the Omni audio towers,
   Qwen3-ASR through its conv front) share one chain with gemma3v: the pre-LN block loop
   `vt_ln_chain` over one offsets record a block (`LayerOffs`; gemma3v's block offsets mapped onto
@@ -96,7 +94,7 @@ the chain runs it (the projector tails of gemma4a and of the chat towers). Where
   position rows off a plane of the stem's own; the residual rows read back into the state and left in the
   chain's x buffer, which the block loop reads without its upload (`x_ready`). The mel stays on the CPU, and
   the mul_mm arm keeps the CPU stem. The chat projector tail rides the chain behind the last block
-  (`register_tower_blocks_tail_gpu`, `vt_ct_enc`): the CPU `audio_encode` tail's steps at its widths - the pair
+  (`register_tower_blocks_tail_gpu`, `vt_ct_enc`): the CPU `audio_projector_tail`'s steps at its widths - the pair
   pool and the post-norm (ultravox norms every position, then rms-norms the stacked rows), the projector GEMMs
   off the arm's feed over the q8 projector planes uploaded beside the block records, qwen2a's bias, the swapped
   gate with its mid rms or voxtral's erf GELU - and reads the soft tokens back in the blocks' rows' place; it
@@ -123,26 +121,27 @@ the chain runs it (the projector tails of gemma4a and of the chat towers). Where
   relative-position attention in its own class with the query's per-dim scale and the key scale folded in, the
   conv module's GLU and causal depthwise taps as row classes. The RPE table rides the resident's rel quartet
   and its projection is a 13-row batch GEMM on its own set.
-- **canary** serves the blocks seat with the whisper-class row classes (layernorm, the bias
-  class with a silu mode, the layernorm seam with the half residual weight) plus two of its own:
-  the full bidirectional Transformer-XL attention with the u/v biases and an online softmax, and
-  the centered depthwise conv with the folded BatchNorm and silu. The front seat runs the spectrum,
-  the mel and the per-feature normalization, conv0 (im2col, the f16 GEMM, bias + relu, the length
-  mask), the two depthwise + pointwise stages (the pointwise on the cm2 q8 tile), the feature rows
-  and the input projection into the residual stream. The sinusoidal rel table is per encode
-  (2 npos - 1 rows) and a row class builds it on the device ahead of the blocks (the CPU table stays
-  the CPU chain's), so the rel quartet is sized by the scratch and the table's projection is a
-  batch GEMM over those rows. The attention does not walk the projected table per row: per head
-  the (q + v) and rel-table panels are the restride stamps at one head - unpadded f16 panels, the
-  (q + v) one on the biased stamp with the head's slice of `bias_v` as its bias row - the plane R = (q + v) P^T runs on the f16
-  coopmat GEMM, and a tiled online-softmax kernel (`TowerCnAttnRT`, a workgroup per 64 query rows
-  of one head) scores ((q_i + u) . k_j + R[i][npos - 1 - i + j]) x scale, reading R beside the keys
-  and values staged 32 a tile through workgroup memory - the plane's [cap x 2 cap - 1] f32 rows are
-  the resident's `vt_cn_rel_plane` scratch,
-  grown by the row capacity. The chain carries no row cap of its own (`vt_cn_rows_ok`): the
-  scratch, the rel quartet and the plane each bind as one range, and the clip declines only where
-  one passes the device's range. The family's hook fires on either lane: the Metal driver declines
-  the q8 encoder, this one the f32 encoder.
+- **canary and parakeet** share one FastConformer chain over a family descriptor (`VtFc`): canary's biased GEMMs and
+  channel-major taps, parakeet's bias-less GEMMs (the seams on the bare stamp, the activations alone) and tap-major
+  taps, its CPU mel uploaded where canary's spectrum runs on the device, its whole encode one hook
+  (`register_parakeet_gpu_encode`: the front chain, then the blocks; the lever `set_vulkan_parakeet_front`). The
+  blocks seat runs the whisper-class row classes (layernorm, the bias class with a silu mode, the layernorm seam
+  with the half residual weight) plus two of its own: the full bidirectional Transformer-XL attention with the u/v
+  biases and an online softmax, and the centered depthwise conv with the folded BatchNorm and silu. The front seat
+  runs the spectrum, the mel and the per-feature normalization, conv0 (im2col, the f16 GEMM, bias + relu, the length
+  mask), the two depthwise + pointwise stages (the pointwise on the cm2 q8 tile), the feature rows and the input
+  projection into the residual stream. The sinusoidal rel table is per encode (2 npos - 1 rows) and a row class
+  builds it on the device ahead of the blocks (the CPU table stays the CPU chain's), so the rel quartet is sized by
+  the scratch and the table's projection is a batch GEMM over those rows. The attention does not walk the projected
+  table per row: per head the (q + v) and rel-table panels are the restride stamps at one head - unpadded f16
+  panels, the (q + v) one on the biased stamp with the head's slice of `bias_v` as its bias row - the plane R = (q +
+  v) P^T runs on the f16 coopmat GEMM, and a tiled online-softmax kernel (`TowerCnAttnRT`, a workgroup per 64 query
+  rows of one head) scores ((q_i + u) . k_j + R[i][npos - 1 - i + j]) x scale, reading R beside the keys and values
+  staged 32 a tile through workgroup memory - the plane's [cap x 2 cap - 1] f32 rows are the resident's
+  `vt_cn_rel_plane` scratch, grown by the row capacity. The chain carries no row cap of its own (`vt_cn_rows_ok`):
+  the scratch, the rel quartet and the plane each bind as one range, and the clip declines only where one passes the
+  device's range. The family's hook fires on either lane: the Metal driver declines the q8 encoder, this one the f32
+  encoder.
 
 The GEMM sites of the gemma4a and canary chains ride the cm2 f16 feed where the device has the
 cm2 tile family (`vt_cm2_feed`): a site names its tile once (`VtTile` - the cm2 token column, or
