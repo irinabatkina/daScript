@@ -195,3 +195,6 @@ def tts_div(a, b : float) : float {
     let q = a * r
     return mad(mad(-q, b, a), r, q)
 }
+
+//! `v` stored as a half, saturated at the half's largest finite magnitude instead of overflowing to infinity
+def half_sat(v : float) : float16 => float16(clamp(v, -65504.0, 65504.0))

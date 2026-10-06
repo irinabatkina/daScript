@@ -416,11 +416,17 @@ accumulator where the two laws part by whole cycles, and the driver's own noise 
 fill kernel (finite, repeatable per seed, moving with it); the STFT on either pad law's stamp and
 the inverse STFT with and without the window envelope. Each carries a poisoned input. The census row is one synthesis each
 on kitten-nano (the ONNX law's stamps) and kokoro-82m (the torch law's) on the file's planes (`cov_tower_styletts2`). The parakeet
-front's cells (the same file): the first conv and the depthwise conv on an 11 x 10 image - odd
-along one axis, even along the other, so each edge drops its own taps - against the in-test
-loops, the sums asserted to take both signs so the first conv's ReLU and the depthwise conv's
-lack of one both show; the feature permute bit for bit with its row pad zero under a sentinel
-fill; the bias-and-ReLU row pass against max(x + b, 0) over sums of both signs. The whisper-class projector tail's
+front's cells (the same file): the first conv on an 11 x 10 image - odd along one axis, even along
+the other, so each edge drops its own taps - against the in-test loop, the sums asserted to take
+both signs so the ReLU shows; the depthwise conv on the shared template's two Metal stamps
+(parakeet's tap-major taps, canary's channel-major ones) against the same loop, then under a length
+mask that must move the rows past it; the feature permute (the shared template) bit for bit with
+its row pad zero under a sentinel fill; the bias-and-ReLU row pass against max(x + b, 0) over sums
+of both signs. The shared templates' other Metal stamps (the same file): the conv module's GLU
+against the CPU form with the halves swapped as the control, the subsample LayerNorm + ReLU off
+padded rows against a double form with a scaled weight row as the control, and the FastConformers'
+rel-position table against the CPU `rel_pos_table` with its zero pad rows and the table of one
+frame more as the control. The whisper-class projector tail's
 two row kernels (`tw_tail_rows_gate`): the pair pool and the row-split gate at a 70-wide row over
 five rows against their host forms, the gate's fixture asserted to tell its halves apart; the vision
 tails' row kernels - the grid mean pool (`tw_pool2d_gate`: a 6 x 4 row grid pooled 2 x 2 against the

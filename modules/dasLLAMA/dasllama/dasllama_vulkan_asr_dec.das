@@ -506,7 +506,7 @@ def private wd_announce {
 
 //! one decoder attention pass: the chunk partials over the K/V rows at element `kvoff` (the query's bias row at `qboff`),
 //! then their combine with its requant
-def private wd_attn(raw : VkCommandBuffer; var h : VkHaz; var s_part : VkDescriptorSet; var pc : TowerWdecAttnArgs; var pc_comb : TowerWdecCombArgs;
+def private wd_attn(raw : VkCommandBuffer; var h : VkHaz; var s_part : VkDescriptorSet; var pc : GkWdecAttnArgs; var pc_comb : GkWdecCombArgs;
                     kvoff, qboff : uint; wg_part, wg_comb : int64) {
     pc.koff = kvoff
     pc.voff = kvoff
@@ -684,11 +684,12 @@ def private vulkan_whisper_decode(w : WhisperModel; var ds : DecoderState; toks 
     let nch_c = (ta + int64(WDEC_CHUNK) - 1l) / int64(WDEC_CHUNK)
     var pc_kv = TowerWdecKvArgs(rows = uint(n), sstride = uint(3l * d), soff = uint(d), nheads = uint(hh), tstride = uint(tmax), p0 = uint(p0),
         dst_off = 0u, boff = 0u, bias_on = 0u, mode = WDEC_KV_F16)
-    var pc_as = TowerWdecAttnArgs(dim = uint(3l * d), tstride = uint(tmax), len0 = uint(p0 + 1l), causal = 1u, nheads = uint(hh),
-        nrows = uint(n), koff = 0u, voff = 0u, qboff = 0u)
-    var pc_ac = TowerWdecAttnArgs(dim = uint(d), tstride = uint(ta), len0 = uint(ta), causal = 0u, nheads = uint(hh),
-        nrows = uint(n), koff = 0u, voff = 0u, qboff = 0u)
-    var pc_cs = TowerWdecCombArgs(dim = uint(d), nchunks = uint(nch_s), nheads = uint(hh), nrows = uint(n))
+    let wd_scale = 1.0 / sqrt(float(WDEC_HS))
+    var pc_as = GkWdecAttnArgs(dim = uint(3l * d), tstride = uint(tmax), len0 = uint(p0 + 1l), causal = 1u, nheads = uint(hh),
+        nrows = uint(n), koff = 0u, voff = 0u, qboff = 0u, hs = WDEC_HS, scale = wd_scale)
+    var pc_ac = GkWdecAttnArgs(dim = uint(d), tstride = uint(ta), len0 = uint(ta), causal = 0u, nheads = uint(hh),
+        nrows = uint(n), koff = 0u, voff = 0u, qboff = 0u, hs = WDEC_HS, scale = wd_scale)
+    var pc_cs = GkWdecCombArgs(dim = uint(d), nchunks = uint(nch_s), nheads = uint(hh), nrows = uint(n), hs = WDEC_HS)
     var pc_cc = pc_cs
     pc_cc.nchunks = uint(nch_c)
     var pc_gelu = TowerBiasRqArgs(d = uint(4l * d), nblk = uint(nff / q8e), boff = 0u)

@@ -453,44 +453,53 @@ def private clamp_gate(t : T?; var dev, queue; total : int; side : int; inplace 
     }
 }
 
-// head restride (gemma3v): token-major rows repack [npos x n_head*hs_src] -> [npos x n_head*hs_dst]
-// with dst lanes past hs_src zeroed; exact both directions, the pad sentinel untouched.
-def private head_restride_gate(t : T?; var dev, queue; npos, n_head, hs_src, hs_dst : int) {
-    let total = npos * n_head * hs_dst
-    let tag = "head_restride npos={npos} heads={n_head} {hs_src}->{hs_dst}"
+//! The head restride on the shared template's two Metal stamps: the pad writes the tile panel [npos x heads x hsp] off the compact
+//! rows with zero lanes past hs and the output past the panel keeps its sentinel; the unpad reads the compact rows back off a
+//! padded panel. Both bit for bit against the host walk.
+def private head_restride_gate(t : T?; var dev, queue; npos, n_head, hs, hsp : int) {
+    let tag = "head_restride npos={npos} heads={n_head} {hs}->{hsp}"
     with_metal_cell(dev, queue) $(var mc : MetalCell) {
         var err : string
-        let st = stamp_of(@@enc_head_restride)
-        var pso = mc |> keep_stamp(st, err)
-        return if (!pso_ok(t, tag, pso, err))
+        let sp = stamp_of(@@enc_head_pad)
+        let su = stamp_of(@@enc_head_unpad)
+        var pso_p = mc |> keep_stamp(sp, err)
+        return if (!pso_ok(t, "{tag} pad", pso_p, err))
+        var pso_u = mc |> keep_stamp(su, err)
+        return if (!pso_ok(t, "{tag} unpad", pso_u, err))
+        let d = n_head * hs
+        let total_p = npos * n_head * hsp
         var inscope src : array<float>
-        src |> resize(npos * n_head * hs_src)
+        src |> resize(npos * d)
         for (i in range(length(src))) {
             src[i] = 0.31 * float(i % 89) - 13.0
         }
-        var inscope want : array<float>
-        want |> resize(total + 16)
-        for (i in range(total + 16)) {
-            if (i >= total) {
-                want[i] = -1000.0   // the pad sentinel
+        var inscope want_p : array<float>
+        want_p |> resize(total_p + 16)
+        for (i in range(total_p + 16)) {
+            if (i >= total_p) {
+                want_p[i] = -1000.0   // the pad sentinel
             } else {
-                let lane = i % hs_dst
-                let hp = i / hs_dst
-                want[i] = lane < hs_src ? src[hp * hs_src + lane] : 0.0
+                let lane = i % hsp
+                let hp = i / hsp
+                want_p[i] = lane < hs ? src[hp * hs + lane] : 0.0
             }
         }
+        var ka = GkRestrideArgs(rows = uint(npos), rows_pad = uint(npos), nheads = uint(n_head), hs = uint(hs), hsp = uint(hsp), sstride = uint(d), soff = 0u, boff = 0u)
         let bs = mc |> in_(src)
-        let bd = mc |> out_words(total + 16, -1000.0)
-        let bsrc_hs = mc |> in_plain([uint(hs_src)])
-        let bdst_hs = mc |> in_plain([uint(hs_dst)])
-        let btot = mc |> in_plain([uint(total)])
+        let bp = mc |> out_words(total_p + 16, -1000.0)
+        let bc = mc |> out_words(npos * d, -1000.0)
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
-            stamp_run(st, pso) {
-                invoke(st.enc, enc, mc.buf[bs], 0ul, mc.buf[bd], 0ul, mc.buf[bsrc_hs], mc.buf[bdst_hs], mc.buf[btot], int64(total))
+            stamp_run(sp, pso_p) {
+                invoke(sp.enc, enc, mc.buf[bs], mc.buf[bp], ka, int64(total_p))
+            }
+            metal_memory_barrier(enc)
+            stamp_run(su, pso_u) {
+                invoke(su.enc, enc, mc.buf[bp], mc.buf[bc], ka, int64(total_p))
             }
         }
         return if (!ran)
-        check_buf(t, tag, mc.buf[bd], want, BAR_BITS, Shape(row_width = hs_dst))
+        check_buf(t, "{tag} pad", mc.buf[bp], want_p, BAR_BITS, Shape(row_width = hsp))
+        check_buf(t, "{tag} unpad", mc.buf[bc], src, BAR_BITS, Shape(row_width = hs))
     }
 }
 
@@ -537,12 +546,10 @@ def private rope2d_gate(t : T?; var dev, queue; npos, n_head, hs : int) {
         let total = npos * n_head * pairs
         let bx = mc |> io_(x)
         let btabs = mc |> in_(tabs)
-        let bd = mc |> in_plain([uint(d)])
-        let bpairs = mc |> in_plain([uint(pairs)])
-        let btot = mc |> in_plain([uint(total)])
+        var ka = GkRope2dArgs(nheads = uint(n_head), hs = uint(hs), rows = uint(npos))
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
             stamp_run(st, pso) {
-                invoke(st.enc, enc, mc.buf[bx], mc.buf[btabs], mc.buf[bd], mc.buf[bpairs], mc.buf[btot], int64(total))
+                invoke(st.enc, enc, mc.buf[bx], mc.buf[btabs], ka, int64(total))
             }
         }
         return if (!ran)
@@ -1013,24 +1020,17 @@ def private wdec_attn_pc_gate(t : T?; var dev, queue; n, dim, hh, tstride, len0 
         let bpms = mc |> out_words(nch * hh * n * 2, -888.0)
         let bpy = mc |> out_words(nch * hh * n * hs, -888.0)
         let by = mc |> out_words(n * dim, -444.0)
-        let bdim = mc |> in_plain([uint(dim)])
-        let bhs = mc |> in_plain([uint(hs)])
-        let bts = mc |> in_plain([uint(tstride)])
-        let blen = mc |> in_plain([uint(len0)])
-        let bca = mc |> in_plain([causal ? 1u : 0u])
-        let bsc = mc |> in_plain([scale])
-        let bhh = mc |> in_plain([uint(hh)])
-        let bn = mc |> in_plain([uint(n)])
-        let bnch = mc |> in_plain([uint(nch)])
+        var kp_args = GkWdecAttnArgs(dim = uint(dim), tstride = uint(tstride), len0 = uint(len0), causal = causal ? 1u : 0u, nheads = uint(hh),
+            nrows = uint(n), koff = 0u, voff = 0u, qboff = 0u, hs = uint(hs), scale = scale)
+        var kc_args = GkWdecCombArgs(dim = uint(dim), nchunks = uint(nch), nheads = uint(hh), nrows = uint(n), hs = uint(hs))
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
-            let (pms, py, dm, hsb, hhb, nb) = (mc.buf[bpms], mc.buf[bpy], mc.buf[bdim], mc.buf[bhs], mc.buf[bhh], mc.buf[bn])
+            let (pms, py) = (mc.buf[bpms], mc.buf[bpy])
             stamp_run(sp, pp) {
-                invoke(sp.enc, enc, mc.buf[bq], mc.buf[bk], 0ul, mc.buf[bv], 0ul, pms, py, mc.buf[bqb], 0ul, dm, hsb, mc.buf[bts], mc.buf[blen],
-                    mc.buf[bca], mc.buf[bsc], hhb, nb, int64(hh), int64(n), int64(nch))
+                invoke(sp.enc, enc, mc.buf[bq], mc.buf[bk], mc.buf[bv], pms, py, mc.buf[bqb], kp_args, int64(nch * hh * n))
             }
             metal_memory_barrier(enc)
             stamp_run(sc, pc) {
-                invoke(sc.enc, enc, pms, py, mc.buf[by], dm, hsb, mc.buf[bnch], hhb, nb, int64(hh), int64(n))
+                invoke(sc.enc, enc, pms, py, mc.buf[by], kc_args, int64(hh * n))
             }
         }
         return if (!ran)
@@ -1187,17 +1187,10 @@ def private im2col2d_gate(t : T?; var dev, queue; iw, ih, cin, kd, sstride : int
         }
         let bsrc = mc |> in_(src)
         let bcol = mc |> out_words(total, -222.0)
-        let biw = mc |> in_plain([uint(iw)])
-        let bih = mc |> in_plain([uint(ih)])
-        let bcin = mc |> in_plain([uint(cin)])
-        let bow = mc |> in_plain([uint(ow)])
-        let bkd = mc |> in_plain([uint(kd)])
-        let bss = mc |> in_plain([uint(sstride)])
-        let btot = mc |> in_plain([uint(total)])
+        var ka = GkIm2col2dArgs(iw = uint(iw), ih = uint(ih), cin = uint(cin), sstride = uint(sstride), kdp = uint(kd), rows = uint(rows), soff = 0u)
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
             stamp_run(st, pso) {
-                invoke(st.enc, enc, mc.buf[bsrc], 0ul, mc.buf[bcol], mc.buf[biw], mc.buf[bih], mc.buf[bcin], mc.buf[bow], mc.buf[bkd], mc.buf[bss],
-                    mc.buf[btot], int64(total))
+                invoke(st.enc, enc, mc.buf[bsrc], mc.buf[bcol], ka, int64(total))
             }
         }
         return if (!ran)
@@ -1823,8 +1816,7 @@ def test_metal_misc_kernels(t : T?) {
                 }
                 rope2d_gate(t, dev, queue, 36, 12, 64)         // the E2B 96x96 grid shape (6x6 patches)
                 rope2d_gate(t, dev, queue, 5, 2, 8)            // tiny: one head pair, q = 2
-                head_restride_gate(t, dev, queue, 7, 16, 72, 128)   // the gemma3v pad direction
-                head_restride_gate(t, dev, queue, 7, 16, 128, 72)   // and the compact
+                head_restride_gate(t, dev, queue, 7, 16, 72, 128)   // the gemma3v pad and its compact back
                 head_restride_gate(t, dev, queue, 3, 2, 5, 5)       // identity at an odd width, %64 tail
                 cross_kx_gate(t, dev, queue, 96, 128, 2, false)   // whisper hs=64; exact total%64
                 cross_kx_gate(t, dev, queue, 12, 16, 2, true)     // ceil grid guard + the layer-offset slot

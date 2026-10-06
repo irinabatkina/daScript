@@ -3634,7 +3634,8 @@ def metal_decode_init : bool {   // nolint:STYLE038 — a flat compile_pso per k
     g_pso_q3v_stem = compile_stamp(metal_q3v_stem_msl, ok)
     g_pso_clamp = compile_stamp(metal_clamp_msl, ok)
     g_pso_rope2d = compile_stamp(metal_rope2d_msl, ok)
-    g_pso_head_restride = compile_stamp(metal_head_restride_msl, ok)
+    g_pso_head_pad = compile_stamp(metal_head_pad_msl, ok)
+    g_pso_head_unpad = compile_stamp(metal_head_unpad_msl, ok)
     g_pso_geglu_quick = compile_stamp(MetalGegluQuick_metal_ew2_msl, ok)
     g_pso_cross_kx = compile_stamp(metal_cross_kx_msl, ok)
     g_pso_cross_vx = compile_stamp(metal_cross_vx_msl, ok)
@@ -4673,7 +4674,7 @@ def metal_kernels_release {
     release_handles(g_pso_rms, g_pso_rms_hx, g_pso_dn_ba, g_pso_moe_router_b, g_pso_add, g_pso_addrms_hx)
     release_handles(g_pso_addrms, g_pso_preaddrms, g_one, g_zero, g_pso_geglu, g_pso_geglu_hx)
     release_handles(g_pso_ln, g_pso_gelu_erf, g_pso_gelu_lut, g_pso_posadd, g_pso_q3v_stem, g_pso_clamp)
-    release_handles(g_pso_rope2d, g_pso_head_restride, g_pso_geglu_quick, g_pso_cross_kx, g_pso_cross_vx, g_pso_cross_vx_h)
+    release_handles(g_pso_rope2d, g_pso_head_pad, g_pso_head_unpad, g_pso_geglu_quick, g_pso_cross_kx, g_pso_cross_vx, g_pso_cross_vx_h)
     release_handles(g_pso_im2col2d, g_pso_wdec_attn_part, g_pso_wdec_attn_comb, g_pso_bias_add_res, g_pso_bias_gelu_lut)
     release_handles(g_pso_f32mm, g_pso_softcap, g_pso_suppress, g_pso_swiglu, g_pso_swiglu_hx, g_pso_swiglu_hxb)
     release_handles(g_pso_swiglu_b, g_pso_geglu_hxb, g_pso_geglu_b, g_pso_attn16, g_pso_attn32, g_pso_attnp16)
@@ -5228,66 +5229,32 @@ class MetalClamp {
     }
 }
 
-// Head restride (gemma3v): repack token-major rows [npos x n_head*hs_src] to [npos x n_head*hs_dst],
-// zero-filling dst lanes past hs_src — pads Q/K/V to the attention tile head width (72 -> 128) and
-// compacts the AV output back; zero pads keep both directions exact.
-[metal_dispatch(name = "enc_head_restride", pso = "g_pso_head_restride", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalHeadRestride {
-    @ssbo @binding = 0 @role = "read" @off = "soff" src : array<float>
-    @ssbo @binding = 1 @role = "write" @off = "doff" dst : array<float>
-    @uniform @binding = 2 hs_src : uint
-    @uniform @binding = 3 hs_dst : uint
-    @uniform @binding = 4 total : uint   // npos * n_head * hs_dst
-
-    [metal_kernel(name="metal_head_restride_msl")]
-    def metal_head_restride {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        let lane = gid % hs_dst
-        let hp = gid / hs_dst
-        dst[gid] = lane < hs_src ? src[hp * hs_src + lane] : 0.0
+//! The head restride around the attention tiles (gemma3v, the qwen vision towers), on the template both homes stamp: the pad
+//! writes the tile's wider head panel with zero lanes past hs, the unpad reads the compact rows back off it
+[metal_dispatch(name = "enc_head_pad", pso = "g_pso_head_pad", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalHeadPad : GkRestride {
+    [metal_kernel(name="metal_head_pad_msl")]
+    def metal_head_pad {
+        restride_body()
     }
 }
 
-// The gemma4v two-axis NEOX rope over token-major rows [npos x n_head*hs]: each head's first hs/2
-// dims rotate by the row's x table, the second hs/2 by its y table — `tabs` packs the CPU's four
-// tables per row as [cx | sx | cy | sy], `pairs` (= hs/4) wide each; one thread per (row, head, j).
-[metal_dispatch(name = "enc_rope2d", pso = "g_pso_rope2d", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalRope2D {
-    @ssbo @binding = 0 @role = "readwrite" x : array<float>     // [npos x d]
-    @ssbo @binding = 1 @role = "read" tabs : array<float>       // [npos x 4q]
-    @uniform @binding = 2 d : uint
-    @uniform @binding = 3 pairs : uint   // rotated pairs per axis, one table row; the head is 4 of them
-    @uniform @binding = 4 total : uint   // npos * n_head * pairs
+[metal_dispatch(name = "enc_head_unpad", pso = "g_pso_head_unpad", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalHeadUnpad : GkRestride {
+    override PAD = false
 
+    [metal_kernel(name="metal_head_unpad_msl")]
+    def metal_head_unpad {
+        restride_body()
+    }
+}
+
+//! The gemma4v two-axis NEOX rope over token-major rows, on the template both homes stamp
+[metal_dispatch(name = "enc_rope2d", pso = "g_pso_rope2d", tg = 64, grid = "total/64", params = "total : int64")]
+class MetalRope2D : GkRope2d {
     [metal_kernel(name="metal_rope2d_msl")]
     def metal_rope2d {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        let hs = 4u * pairs
-        let n_head = d / hs
-        let r = gid / (n_head * pairs)
-        let rem = gid % (n_head * pairs)
-        let h = rem / pairs
-        let j = rem % pairs
-        let base = r * d + h * hs
-        let tb = r * 4u * pairs
-        let cx = tabs[tb + j]
-        let sx = tabs[tb + pairs + j]
-        let cy = tabs[tb + 2u * pairs + j]
-        let sy = tabs[tb + 3u * pairs + j]
-        let x0 = x[base + j]
-        let x1 = x[base + j + pairs]
-        x[base + j] = x0 * cx - x1 * sx
-        x[base + j + pairs] = x0 * sx + x1 * cx
-        let y0 = x[base + 2u * pairs + j]
-        let y1 = x[base + 3u * pairs + j]
-        x[base + 2u * pairs + j] = y0 * cy - y1 * sy
-        x[base + 3u * pairs + j] = y0 * sy + y1 * cy
+        rope2d_body()
     }
 }
 
@@ -5377,173 +5344,33 @@ class MetalCrossVxH : MetalCrossVxT {
     }
 }
 
-// The chunked twin pair: Part computes one 256-t chunk's online-softmax partial per
-// (head, row, chunk) — local max m, exp-sum s, unnormalized weighted-V y — Comb merges the
-// chunks by log-sum-exp. 6-8x the threadgroups of the single-pass form on a 1500-t cross.
-[metal_dispatch(name = "enc_wdec_attn_part", pso = "g_pso_wdec_attn_part", tgmem = "metal_wdec_attn_part_msl_tgmem", tg = 128, grid = "heads, nrows, nch", params = "heads : int64, nrows : int64, nch : int64")]
-class MetalWdecAttnPart {
-    @ssbo @binding = 0 @role = "read" q : array<float>                    // [n x dim] (unscaled, pre-bias)
-    @ssbo @binding = 1 @role = "read" @off = "koff" kk : array<float16>   // [hh][tstride][hs]
-    @ssbo @binding = 2 @role = "read" @off = "voff" vv : array<float16>   // [hh][tstride][hs]
-    @ssbo @binding = 3 @role = "write" pms : array<float>                 // [nch][hh][n][2] (m, s)
-    @ssbo @binding = 4 @role = "write" py : array<float>                  // [nch][hh][n][hs]
-    @ssbo @binding = 5 @role = "weight" @off = "qboff" qb : array<float>  // [dim] q bias, folded at load
-    @uniform @binding = 6 dim : uint
-    @uniform @binding = 7 hs : uint
-    @uniform @binding = 8 tstride : uint
-    @uniform @binding = 9 len0 : uint
-    @uniform @binding = 10 causal : uint
-    @uniform @binding = 11 scale : float
-    @uniform @binding = 12 nheads : uint
-    @uniform @binding = 13 nrows_u : uint
-    @workgroup scores : float[256]
-    @workgroup partial : float[32]
-
+//! The chunked twin pair on the templates both homes stamp: Part computes one 256-key chunk's online-softmax partial per
+//! (chunk, head, row) - local max m, exp-sum s, unnormalized weighted V - and Comb merges the chunks by log-sum-exp;
+//! 6-8x the threadgroups of the single-pass form on a 1500-key cross
+[metal_dispatch(name = "enc_wdec_attn_part", pso = "g_pso_wdec_attn_part", tgmem = "metal_wdec_attn_part_msl_tgmem", tg = 128, grid = "groups", params = "groups : int64")]
+class MetalWdecAttnPart : GkWdecAttnPart {
     [metal_kernel(name="metal_wdec_attn_part_msl")]
-    def metal_wdec_attn_part {   // nolint:STYLE038 — the phases are barrier-coupled, the kernel body is the shape
-        let h = gl_WorkGroupID.x
-        let r = gl_WorkGroupID.y
-        let c = gl_WorkGroupID.z
-        let lid = gl_LocalInvocationID.x
-        let len = causal != 0u ? len0 + r : len0
-        let tb = c * 256u
-        let te = min(tb + 256u, len)
-        let slot = (c * nheads + h) * nrows_u + r
-        let qbase = r * dim + h * hs
-        let kbase = h * tstride * hs
-        var t = tb + lid
-        while (t < te) {
-            var s = 0.0
-            var j = 0u
-            while (j < hs) {
-                s += (q[qbase + j] + qb[h * hs + j]) * float(kk[kbase + t * hs + j])
-                s += (q[qbase + j + 1u] + qb[h * hs + j + 1u]) * float(kk[kbase + t * hs + j + 1u])
-                s += (q[qbase + j + 2u] + qb[h * hs + j + 2u]) * float(kk[kbase + t * hs + j + 2u])
-                s += (q[qbase + j + 3u] + qb[h * hs + j + 3u]) * float(kk[kbase + t * hs + j + 3u])
-                j += 4u
-            }
-            scores[t - tb] = s * scale
-            t += gl_WorkGroupSize.x
-        }
-        barrier()
-        let nloc = te > tb ? te - tb : 0u
-        var mx = -3.0e38
-        t = lid
-        while (t < nloc) {
-            mx = max(mx, scores[t])
-            t += gl_WorkGroupSize.x
-        }
-        let m = tg_max_all(mx, partial)
-        var ss = 0.0
-        t = lid
-        while (t < nloc) {
-            let e = exp(scores[t] - m)
-            scores[t] = e
-            ss += e
-            t += gl_WorkGroupSize.x
-        }
-        barrier()
-        let tot = tg_sum_all(ss, partial)   // its barrier also fences the exp pass's scores for the V loop
-        if (lid == 0u) {
-            pms[slot * 2u] = nloc > 0u ? m : -3.0e38
-            pms[slot * 2u + 1u] = tot
-        }
-        var j = lid
-        while (j < hs) {
-            var acc = 0.0
-            var tt = 0u
-            while (tt < nloc) {
-                acc += scores[tt] * float(vv[kbase + (tb + tt) * hs + j])
-                tt++
-            }
-            py[slot * hs + j] = acc
-            j += gl_WorkGroupSize.x
-        }
+    def metal_wdec_attn_part {
+        wdec_attn_part_body()
     }
 }
 
-[metal_dispatch(name = "enc_wdec_attn_comb", pso = "g_pso_wdec_attn_comb", tg = 64, grid = "heads, nrows", params = "heads : int64, nrows : int64")]
-class MetalWdecAttnComb {
-    @ssbo @binding = 0 @role = "read" pms : array<float>    // [nch][hh][n][2]
-    @ssbo @binding = 1 @role = "read" py : array<float>     // [nch][hh][n][hs]
-    @ssbo @binding = 2 @role = "write" y : array<float>     // [n x dim]
-    @uniform @binding = 3 dim : uint
-    @uniform @binding = 4 hs : uint
-    @uniform @binding = 5 nch : uint
-    @uniform @binding = 6 nheads : uint
-    @uniform @binding = 7 nrows_u : uint
-
+[metal_dispatch(name = "enc_wdec_attn_comb", pso = "g_pso_wdec_attn_comb", tg = 64, grid = "groups", params = "groups : int64")]
+class MetalWdecAttnComb : GkWdecAttnComb {
     [metal_kernel(name="metal_wdec_attn_comb_msl")]
     def metal_wdec_attn_comb {
-        let h = gl_WorkGroupID.x
-        let r = gl_WorkGroupID.y
-        let lid = gl_LocalInvocationID.x
-        var mg = -3.0e38
-        var c = 0u
-        while (c < nch) {
-            mg = max(mg, pms[((c * nheads + h) * nrows_u + r) * 2u])
-            c++
-        }
-        var tot = 0.0
-        c = 0u
-        while (c < nch) {
-            let slot = (c * nheads + h) * nrows_u + r
-            tot += pms[slot * 2u + 1u] * exp(pms[slot * 2u] - mg)
-            c++
-        }
-        let inv = 1.0 / tot
-        var j = lid
-        while (j < hs) {
-            var acc = 0.0
-            c = 0u
-            while (c < nch) {
-                let slot = (c * nheads + h) * nrows_u + r
-                acc += py[slot * hs + j] * exp(pms[slot * 2u] - mg)
-                c++
-            }
-            y[r * dim + h * hs + j] = acc * inv
-            j += gl_WorkGroupSize.x
-        }
+        wdec_attn_comb_body()
     }
 }
 
-// The qwen3a conv2d im2col (k=3, s=2, p=1, one [iw x ih] block, `sstride` floats per source
-// pixel): output row (oy*ow+ox) carries `kd` columns — cin*9 real ones in (ic, kh, kw) order
-// (conv2d_s2's walk) then zero pad, so the tile GEMM's kdim%32 holds at any cin.
+//! The conv2d im2col (k3 s2 p1) over a block of channel rows, on the template both homes stamp - the f32 tile's feed here
 [metal_dispatch(name = "enc_im2col2d", pso = "g_pso_im2col2d", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalIm2col2d {
-    @ssbo @binding = 0 @role = "read" @off = "soff" src : array<float>   // [ih x iw x sstride], c fastest
-    @ssbo @binding = 1 @role = "write" col : array<float>                // [oh*ow x kd]
-    @uniform @binding = 2 iw : uint
-    @uniform @binding = 3 ih : uint
-    @uniform @binding = 4 cin : uint
-    @uniform @binding = 5 ow : uint
-    @uniform @binding = 6 kd : uint
-    @uniform @binding = 7 sstride : uint
-    @uniform @binding = 8 total : uint
+class MetalIm2col2d : GkIm2col2d {
+    typedef OT = float
 
     [metal_kernel(name="metal_im2col2d_msl")]
     def metal_im2col2d {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
-            return
-        }
-        let r = gid / kd
-        let k = gid % kd
-        var v = 0.0
-        if (k < cin * 9u) {
-            let ic = k / 9u
-            let kh = (k % 9u) / 3u
-            let kw = k % 3u
-            let oy = r / ow
-            let ox = r % ow
-            let iy = int(oy * 2u + kh) - 1
-            let ix = int(ox * 2u + kw) - 1
-            if (iy >= 0 && iy < int(ih) && ix >= 0 && ix < int(iw)) {
-                v = src[(uint(iy) * iw + uint(ix)) * sstride + ic]
-            }
-        }
-        col[gid] = v
+        im2col2d_body()
     }
 }
 

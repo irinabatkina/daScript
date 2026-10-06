@@ -228,7 +228,7 @@ def private wdec_fused_rq_shape(t : T?; d, rows, nch : int) {   // nolint:STYLE0
             var pa_post = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 1u, lnoff = uint(3 * d), lnboff = uint(4 * d), ascale = 1.0)   // nolint:LINT003 - the same
             var pa_bias = TowerBiasArgs(d = uint(ff), nelem = uint(nff), boff = uint(5 * d), act = BIAS_ACT_GELU_TANH)   // nolint:LINT003 - the same
             var pa_biasrq = TowerBiasRqArgs(d = uint(ff), nblk = uint(nff / q8e), boff = uint(5 * d))   // nolint:LINT003 - the same
-            var pa_c = TowerWdecCombArgs(dim = uint(d), nchunks = uint(nch), nheads = uint(heads), nrows = uint(rows))   // nolint:LINT003 - the same
+            var pa_c = GkWdecCombArgs(dim = uint(d), nchunks = uint(nch), nheads = uint(heads), nrows = uint(rows), hs = WDEC_HS)   // nolint:LINT003 - the same
             let wg4 = int64((nd / 4 + 255) / 256)
             let wg4h = int64((nff / 4 + 255) / 256)
             let wg_comb = int64(heads * rows)
@@ -434,7 +434,7 @@ def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over t
                 var pa_clamp = TowerClampArgs(nelem = uint(nd), lo = lo, hi = hi)
                 var pa_cvt = TowerClampArgs(nelem = uint(nd), lo = lo2, hi = hi2)
                 var pa_rq = RqArgs(inbase = 0u, nblk = uint(nd / q8e), lo = lo2, hi = hi2)
-                var pa_rope = TowerRopeArgs(nheads = uint(ROWS_HEADS), hs = uint(hs), rows = uint(rows))
+                var pa_rope = GkRope2dArgs(nheads = uint(ROWS_HEADS), hs = uint(hs), rows = uint(rows))
                 var pa_geglu = TowerGegluArgs(nelem = uint(nff), glo = -2.0, ghi = 2.5, ulo = -1.5, uhi = 1.75, dlo = -1.0, dhi = 1.2)
                 let wg4 = int64((nd / 4 + 255) / 256)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
@@ -589,11 +589,11 @@ def test_vkt_tower_conformer(t0 : T?) {   // nolint:STYLE038 — one flat gate o
                 var s_dw = cp |> cls_set(fixed_array(gp, cpl, wp), @@set_tower_dw_conv5_cls)
                 var s_attn = cp |> cls_set(fixed_array(qp, kp, vp, aop, rp, wp), @@set_tower_g4a_attn64_cls)
                 var pa_silu = TowerBiasArgs(d = uint(d), nelem = uint(nd), boff = 0u, act = BIAS_ACT_SILU)
-                var pa_convmod = TowerConvModArgs(d = uint(d), nelem = uint(nd))
+                var pa_convmod = GkGatedRowsArgs(d = uint(d), nelem = uint(nd))
                 var pa_dw = GkDwConvRowsArgs(c = uint(d), t_in = uint(rows), t_out = uint(rows), woff = uint(hs))
                 let qscale = (1.0 / sqrt(float(hs))) / log(2.0)
                 let kscale = log(1.0 + exp(1.0)) / log(2.0)
-                var pa_attn = TowerG4aAttnArgs(d = uint(d), npos = uint(rows), pdsoff = 0u)
+                var pa_attn = GkG4aAttnArgs(d = uint(d), npos = uint(rows), hs = uint(hs), pdsoff = 0u, cap = GK_G4A_ATTN_CAP, qscale = qscale, kscale = kscale)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tower_act_cls(raw, h, s_silu, pa_silu, int64((nd / 4 + 255) / 256))
                     enc_tower_glu_sig_cls(raw, h, s_glu, pa_convmod, int64((nd + 255) / 256))
@@ -646,7 +646,7 @@ def test_vkt_tower_conformer(t0 : T?) {   // nolint:STYLE038 — one flat gate o
                 cp |> plane_refill(aop)
                 var s_attn128 = cp |> cls_set(fixed_array(qp, kp, vp, aop, rp, wp), @@set_tower_g4a_attn_cls)
                 let qscale2 = (1.0 / sqrt(float(hs2))) / log(2.0)
-                var pa_attn128 = TowerG4aAttnArgs(d = uint(d), npos = uint(rows), pdsoff = 0u)
+                var pa_attn128 = GkG4aAttnArgs(d = uint(d), npos = uint(rows), hs = uint(hs2), pdsoff = 0u, cap = GK_G4A_ATTN_CAP, qscale = qscale2, kscale = kscale)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tower_g4a_attn_cls(raw, h, s_attn128, pa_attn128, int64((rows * heads2 + 63) / 64))
                 }
@@ -801,7 +801,7 @@ def test_vkt_tower_ln_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate ove
                 var pa_post = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 1u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 1.0)
                 var pa_post0 = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 0u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 1.0)
                 var pa_post_half = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 0u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 0.5)
-                var pa_rs = TowerRestrideArgs(rows = uint(rows), rows_pad = uint(rows_pad), nheads = uint(ROWS_HEADS), hs = uint(LN_HS), hsp = uint(LN_HSP), sstride = uint(d_compact), soff = 0u)
+                var pa_rs = GkRestrideArgs(rows = uint(rows), rows_pad = uint(rows_pad), nheads = uint(ROWS_HEADS), hs = uint(LN_HS), hsp = uint(LN_HSP), sstride = uint(d_compact), soff = 0u)
                 let wg4 = int64((nd / 4 + 255) / 256)
                 let wg_rs = int64((rows_pad * d_padded + 255) / 256)   // the pads cover the 64-aligned cap: the rows past `rows` come out zero
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
@@ -983,7 +983,7 @@ def test_vkt_tower_f16_feeds(t0 : T?) {   // nolint:STYLE038 — one flat gate o
                 var pa_ln = TowerLnArgs(d = uint(d), rows = uint(rows), eps = ROWS_EPS, ln_on = 1u, lnoff = 0u, lnboff = uint(d))
                 var pa_post = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 1u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 1.0)
                 var pa_post0 = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 0u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 1.0)
-                var pa_rs = TowerRestrideArgs(rows = uint(rows), rows_pad = uint(rows_pad), nheads = uint(ROWS_HEADS), hs = uint(LN_HS), hsp = uint(LN_HSP),
+                var pa_rs = GkRestrideArgs(rows = uint(rows), rows_pad = uint(rows_pad), nheads = uint(ROWS_HEADS), hs = uint(LN_HS), hsp = uint(LN_HSP),
                     sstride = uint(d_compact), soff = 0u, boff = uint(2 * d))
                 let wg4 = int64((nd / 4 + 255) / 256)
                 let wg_rs = int64((rows_pad * d_padded + 255) / 256)
@@ -1184,13 +1184,13 @@ def test_vkt_wdec_classes(t0 : T?) {   // nolint:STYLE038 — one flat gate over
                 pa_kx.mode = WDEC_KV_KX
                 var pa_vx = pa_vb
                 pa_vx.mode = WDEC_KV_VX
-                var pa_as = TowerWdecAttnArgs(dim = uint(dim), tstride = uint(tstride), len0 = uint(p0 + 1), causal = 1u, nheads = uint(heads),
-                    nrows = uint(rows), koff = 0u, voff = 0u, qboff = 0u)
+                var pa_as = GkWdecAttnArgs(dim = uint(dim), tstride = uint(tstride), len0 = uint(p0 + 1), causal = 1u, nheads = uint(heads),
+                    nrows = uint(rows), koff = 0u, voff = 0u, qboff = 0u, hs = uint(hs), scale = 1.0 / sqrt(float(hs)))
                 let len_cross = 150   // inside the first chunk, so the cross rows reach the combine with the second chunk's partial empty
                 var pa_ac = pa_as
                 pa_ac.len0 = uint(len_cross)
                 pa_ac.causal = 0u
-                var pa_c = TowerWdecCombArgs(dim = uint(d), nchunks = uint(nch), nheads = uint(heads), nrows = uint(rows))
+                var pa_c = GkWdecCombArgs(dim = uint(d), nchunks = uint(nch), nheads = uint(heads), nrows = uint(rows), hs = uint(hs))
                 let wg_h = int64((p0 * d + 255) / 256)
                 let wg_b = int64((rows * d + 255) / 256)
                 let wg_attn = int64(nch * heads * rows)
@@ -1315,7 +1315,7 @@ def test_vkt_tower_padded_attn(t0 : T?) {
                 let fa = fixed_array(qpp, kpp, vpp, attpp)
                 var s_fa = fa_stamp_set(khr, gather_planes(cp.dev, fa), gather_planes(cp.bytes, fa), gather_planes(cp.hazard_bit, fa))
                 var s_un = cp |> cls_set(fixed_array(attpp, attp), @@set_tower_hunpad_cls)
-                var pa_rs = TowerRestrideArgs(rows = uint(rows), rows_pad = uint(rows_pad), nheads = uint(PAT_HEADS), hs = uint(LN_HS), hsp = uint(LN_HSP), sstride = uint(dc), soff = 0u)
+                var pa_rs = GkRestrideArgs(rows = uint(rows), rows_pad = uint(rows_pad), nheads = uint(PAT_HEADS), hs = uint(LN_HS), hsp = uint(LN_HSP), sstride = uint(dc), soff = 0u)
                 var pa_fa = FaArgs(rows = uint(rows), w0 = 0u, qd = uint(dp), kvd = uint(dp), kv_mul = 1u, kvbase = 0u, scale = scale, window = 0u, sinkoff = 0u)
                 let wg_rs = int64((rows_pad * dp + 255) / 256)   // the pads cover the 64-aligned cap: the K/V shadows past `rows` are zero, not the sentinel
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
@@ -1549,23 +1549,23 @@ def test_vkt_tower_front_movers(t0 : T?) {   // nolint:STYLE038 — one flat gat
                 var s_cvt = cp |> cls_set(fixed_array(xp, cvtp), @@set_tower_clamp_cvt_cls)
                 var s_add = cp |> cls_set(fixed_array(addp, wp), @@set_tower_bias_act_cls)
                 var s_fin = cp |> cls_set(fixed_array(finp, wp), @@set_tower_bias_act_cls)
-                var s_ln = cp |> cls_set(fixed_array(lnp, wp), @@set_tower_ln_relu_cls)
-                var pa_im = TowerIm2colArgs(iw = uint(FM_IW), ih = uint(FM_IH), cin = uint(FM_CIN), kdp = uint(FM_KDP), rows = uint(FM_CHUNKS * FM_OH * FM_OW))
+                var s_ln = cp |> cls_set(fixed_array(lnp, lnp, wp), @@set_tower_ln_relu_cls)
+                var pa_im = GkIm2col2dArgs(iw = uint(FM_IW), ih = uint(FM_IH), cin = uint(FM_CIN), sstride = uint(FM_CIN), kdp = uint(FM_KDP), rows = uint(FM_CHUNKS * FM_OH * FM_OW), soff = 0u)
                 var pa_im1 = TtsIm2colArgs(cin = uint(nch1), tin = uint(len1), tout = uint(len1), k = 3u, stride = 1u, pad_l = 1u, dilation = 1u, kdim = uint(kdp1),
                     rows = 0u)
                 var pa_im2 = TtsIm2colArgs(cin = uint(nch2), tin = uint(len1), tout = uint(rows2), k = 3u, stride = 2u, pad_l = 1u, dilation = 1u, kdim = uint(kdp2),
                     rows = 1u)
-                var pa_sh = TowerQ3aShuffleArgs(nch = uint(q3_nch), npos = uint(q3_pos))
-                var pa_fs = TowerFeatShuffleArgs(w = uint(fs_w), ch = uint(fs_c), t = uint(fs_t))
-                var pa_gq = TowerRestrideArgs(rows = uint(rows), rows_pad = uint(rows), nheads = 1u, hs = uint(hs), hsp = uint(hs), sstride = uint(d),
+                var pa_sh = GkQ3aShuffleArgs(nch = uint(q3_nch), ncp = uint(q3_nch), chunk_stride = uint(16 * 13 * q3_nch), npos = uint(q3_pos))
+                var pa_fs = GkFeatShuffleArgs(w = uint(fs_w), ch = uint(fs_c), t = uint(fs_t), rows_pad = uint(fs_t))
+                var pa_gq = GkRestrideArgs(rows = uint(rows), rows_pad = uint(rows), nheads = 1u, hs = uint(hs), hsp = uint(hs), sstride = uint(d),
                     soff = uint(second_head_base), boff = uint(second_head_base))
-                var pa_gp = TowerRestrideArgs(rows = uint(rows), rows_pad = uint(rows), nheads = 1u, hs = uint(hs), hsp = uint(hs), sstride = uint(d),
+                var pa_gp = GkRestrideArgs(rows = uint(rows), rows_pad = uint(rows), nheads = 1u, hs = uint(hs), hsp = uint(hs), sstride = uint(d),
                     soff = uint(second_head_base))
                 var pa_cvt = TowerClampArgs(nelem = uint(nd), lo = -1.5, hi = 1.5)
                 var pa_add = TowerBiasArgs(d = uint(add_n), nelem = uint(add_n), boff = uint(d), act = BIAS_ACT_NONE)   // the stem's position plane: one bias row the width of the rows
                 var pa_fin_b = TowerBiasArgs(d = uint(d), nelem = uint(nd), boff = uint(2 * d), act = BIAS_ACT_NONE)
                 var pa_fin_p = TowerBiasArgs(d = uint(q3_tok * d), nelem = uint(nd), boff = uint(3 * d), act = BIAS_ACT_NONE)
-                var pa_ln = TowerLnReluArgs(cout = uint(d), rows = uint(rows), woff = 0u, eps = ROWS_EPS)
+                var pa_ln = GkLnReluRowsArgs(cout = uint(d), ldin = uint(d), ldout = uint(d), rows = uint(rows), woff = 0u, eps = ROWS_EPS)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tower_im2col_cls(raw, h, s_im, pa_im, int64((n_col + 255) / 256))
                     enc_tts_im2col16_cls(raw, h, s_im1, pa_im1, int64(len1 * kdp1))
@@ -1794,9 +1794,9 @@ def test_vkt_tower_front_mel(t0 : T?) {   // nolint:STYLE038 — one flat gate o
                     floor = MEL_FLOOR_24, scale = 1.0, frame_major = 1u, add_floor = 1u)
                 var pa_wh = TowerMelLogArgs(n_bins = uint(MEL_NBINS), n_mel = uint(MEL_NMEL), n_frames = uint(MEL_NLEN),
                     floor = MEL_FLOOR_24, scale = MEL_LOG10_E, frame_major = 0u, add_floor = 0u)
-                var pa_norm = TowerMelNormArgs(n_mel = uint(MEL_NMEL), n_frames = uint(NORM_NLEN), valid = uint(NORM_VALID))
-                var pa_dw = TowerDwConvArgs(iw = uint(FM_IW), ih = uint(FM_IH), ch = uint(DW_CH), woff = 0u, boff = uint(DW_CH * 9))
-                var pa_rel = TowerRelSinCosArgs(d = uint(REL_D), tt = uint(tt))
+                var pa_norm = GkMelNormArgs(n_mel = uint(MEL_NMEL), n_frames = uint(NORM_NLEN), valid = uint(NORM_VALID))
+                var pa_dw = GkDwConv2dArgs(iw = uint(FM_IW), ih = uint(FM_IH), ih_valid = uint(FM_IH), ch = uint(DW_CH), woff = 0u, boff = uint(DW_CH * 9))
+                var pa_rel = GkRelSinCosArgs(d = uint(REL_D), tt = uint(tt), rows_pad = uint(2 * tt - 1))
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tower_spec_dft_cls(raw, h, s_mag, pa_mag, int64((n_pw + 255) / 256))
                     enc_tower_spec_dft_cls(raw, h, s_pow, pa_pow, int64((n_pw + 255) / 256))

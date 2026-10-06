@@ -221,7 +221,7 @@ The declines: `quant_mode` on an exact-lane tower (or the bf16 twin), `shape` of
 sizes, past the row cap (`VT_MAX_ENCODE_ROWS`; the canary chain reads the range instead), or with
 a weight plane or scratch buffer over `vk_max_storage_range()`, or where the family's constants
 differ from the ones the kernel home stamps (`Q3A_TOK_PER_CHUNK`, qwen3a's 13 positions a chunk;
-`G4A_ATTN_PAST` and `G4A_ATTN_CAP`, gemma4a's 12-row window and cap 50),
+`GK_G4A_ATTN_PAST` and `GK_G4A_ATTN_CAP`, gemma4a's 12-row window and cap 50),
 `knob` (`DASLLAMA_VK_TOWER`), `device` where the tier's want (`DASLLAMA_GPU`, read before any
 device init) or a class declines, or for every front where the f16 GEMM feed is off
 (`vulkan_tower_front_route`: the `DASLLAMA_COOPMAT=sdot4` mode - the block chains ride the q8

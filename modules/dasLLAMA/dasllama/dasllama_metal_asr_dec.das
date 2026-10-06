@@ -451,13 +451,12 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
     var u_p0 = uniform_u32(uint(p0))
     var u_tmax = uniform_u32(uint(tmax))
     var u_ta = uniform_u32(uint(ta))
-    var u_len_self = uniform_u32(uint(p0 + 1l))
     var u_hh = uniform_u32(uint(hh))
-    var u_nch_s = uniform_u32(uint((p0 + n + 255l) / 256l))
-    var u_nch_c = uniform_u32(uint((ta + 255l) / 256l))
+    let nch_s = (p0 + n + 255l) / 256l
+    let nch_c = (ta + 255l) / 256l
     var u_c1 = uniform_u32(1u)
     var u_c0 = uniform_u32(0u)
-    var u_scale = uniform_f32(1.0 / sqrt(float(hs)))
+    let wd_scale = 1.0 / sqrt(float(hs))
     var u_nv = uniform_u32(uint(g_wd_nvpad))
     var err = ""
     var gpu_ms = 0.0lf
@@ -467,7 +466,6 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
             let lo = dec_layer_offsets(w, l)
             let bo = l * WD_MATS
             let koff_self = uint64(l * d * tmax * 2l)   // the resident K/V memory is f16
-            let koff_cross = uint64(l * d * ta * 2l)
             // self-attention (v bias folds into the append shuffle, q bias into the attention load)
             enc_ln(enc, g_wd_sx, bblobf, uint64(lo.ln1_w * 4l), bblobf, uint64(lo.ln1_b * 4l), g_wd_sxb, 0ul, u_d, u_eps, n)
             if (n == 1l) {   // the fused-QKV GEMV: the q,k,v regions sit contiguous in the driver's blob
@@ -482,15 +480,17 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
                 enc_cross_vx_h(enc, g_wd_sk, 0ul, g_wd_bkc, koff_self, bblobf, 0ul, u_d, u_hs, u_n, u_p0, u_tmax, u_c0, u_totd, n * d)
                 enc_cross_vx_h(enc, g_wd_sv, 0ul, g_wd_bvc, koff_self, bblobf, uint64(lo.v_b * 4l), u_d, u_hs, u_n, u_p0, u_tmax, u_c1, u_totd, n * d)
             }
-            enc_wdec_attn_part(enc, g_wd_sq, g_wd_bkc, koff_self, g_wd_bvc, koff_self, g_wd_bpms, g_wd_bpy, bblobf, uint64(lo.q_b * 4l), u_d, u_hs, u_tmax, u_len_self, u_c1, u_scale, u_hh, u_n, hh, n, (p0 + n + 255l) / 256l)
-            enc_wdec_attn_comb(enc, g_wd_bpms, g_wd_bpy, g_wd_sxb2, u_d, u_hs, u_nch_s, u_hh, u_n, hh, n)
+            enc_wdec_attn_part(enc, g_wd_sq, g_wd_bkc, g_wd_bvc, g_wd_bpms, g_wd_bpy, bblobf, GkWdecAttnArgs(dim = uint(d), tstride = uint(tmax), len0 = uint(p0 + 1l),
+                causal = 1u, nheads = uint(hh), nrows = uint(n), koff = uint(l * d * tmax), voff = uint(l * d * tmax), qboff = uint(lo.q_b), hs = uint(hs), scale = wd_scale), nch_s * hh * n)
+            enc_wdec_attn_comb(enc, g_wd_bpms, g_wd_bpy, g_wd_sxb2, GkWdecCombArgs(dim = uint(d), nchunks = uint(nch_s), nheads = uint(hh), nrows = uint(n), hs = uint(hs)), hh * n)
             wd_mm(enc, g_wd_boffs[bo + 3l], g_wd_sxb2, g_wd_sxb, u_d, u_d, d, d, n)
             enc_bias_add_res(enc, g_wd_sx, g_wd_sxb, bblobf, uint64(lo.o_b * 4l), u_d, u_totd, n * d)
             // cross-attention against the window's resident memory
             enc_ln(enc, g_wd_sx, bblobf, uint64(lo.cln_w * 4l), bblobf, uint64(lo.cln_b * 4l), g_wd_sxb, 0ul, u_d, u_eps, n)
             wd_mm(enc, g_wd_boffs[bo + 4l], g_wd_sxb, g_wd_sq, u_d, u_d, d, d, n)
-            enc_wdec_attn_part(enc, g_wd_sq, g_wd_bkxr, koff_cross, g_wd_bvxr, koff_cross, g_wd_bpms, g_wd_bpy, bblobf, uint64(lo.cq_b * 4l), u_d, u_hs, u_ta, u_ta, u_c0, u_scale, u_hh, u_n, hh, n, (ta + 255l) / 256l)
-            enc_wdec_attn_comb(enc, g_wd_bpms, g_wd_bpy, g_wd_sxb2, u_d, u_hs, u_nch_c, u_hh, u_n, hh, n)
+            enc_wdec_attn_part(enc, g_wd_sq, g_wd_bkxr, g_wd_bvxr, g_wd_bpms, g_wd_bpy, bblobf, GkWdecAttnArgs(dim = uint(d), tstride = uint(ta), len0 = uint(ta),
+                causal = 0u, nheads = uint(hh), nrows = uint(n), koff = uint(l * d * ta), voff = uint(l * d * ta), qboff = uint(lo.cq_b), hs = uint(hs), scale = wd_scale), nch_c * hh * n)
+            enc_wdec_attn_comb(enc, g_wd_bpms, g_wd_bpy, g_wd_sxb2, GkWdecCombArgs(dim = uint(d), nchunks = uint(nch_c), nheads = uint(hh), nrows = uint(n), hs = uint(hs)), hh * n)
             wd_mm(enc, g_wd_boffs[bo + 7l], g_wd_sxb2, g_wd_sxb, u_d, u_d, d, d, n)
             enc_bias_add_res(enc, g_wd_sx, g_wd_sxb, bblobf, uint64(lo.co_b * 4l), u_d, u_totd, n * d)
             // mlp (fc1 bias folds into the LUT-GELU pass, fc2's into the residual add)
@@ -515,13 +515,9 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
     pool_release(g_upool, u_p0, 4ul)
     pool_release(g_upool, u_tmax, 4ul)
     pool_release(g_upool, u_ta, 4ul)
-    pool_release(g_upool, u_len_self, 4ul)
     pool_release(g_upool, u_hh, 4ul)
-    pool_release(g_upool, u_nch_s, 4ul)
-    pool_release(g_upool, u_nch_c, 4ul)
     pool_release(g_upool, u_c1, 4ul)
     pool_release(g_upool, u_c0, 4ul)
-    pool_release(g_upool, u_scale, 4ul)
     pool_release(g_upool, u_nv, 4ul)
     if (!ran) {   // the GPU owns this window's KV — a silent CPU fallback would decode blind
         panic("dasLLAMA wdec: GPU decode failed mid-window: {err}")

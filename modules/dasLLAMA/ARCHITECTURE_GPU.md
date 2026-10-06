@@ -282,6 +282,17 @@ key it has on that home.
   defines the pair over its own primitive (`subgroupAdd` on Vulkan, `simd_sum` on Metal). A free function
   in the common module resolves in the common module and sees neither home, so a body that needs a
   home's primitive keeps it in a method.
+- **A binding a stamp does not use is gated, and a stamp names its element types.** `@template_gate`
+  erases the field at stamping (`daslib/typemacro_boost`, before either emitter reads the class), so a
+  template whose f16 and f32 outputs, or whose bias row, are gated bindings stamps on both homes and the
+  dropped binding is no parameter of that stamp's builder (`GkRestride`). A body that writes one output
+  in two precisions spells its element type through a `typedef` the template leaves undeclared and each
+  stamp declares (`OT`), which both emitters take.
+- **A number the drivers verify is a `let` beside the template, and a scale both homes must round
+  alike is computed on the host.** A template constant's default is a literal, so the window a kernel is
+  stamped for is spelled twice - the constant's default and the `let` each driver checks the family
+  against (`GK_G4A_ATTN_PAST`). A scale derived from the shape (`gk_g4a_attn_scales`) is one host
+  computation passed in the arguments: computed in the kernel, the two homes' intrinsics round it apart.
 - **What stays per home:** the GEMM and attention tiles, which each home builds on its own matrix
   primitives. A pair whose two forms differ in shape (the elementwise maps run one element a thread on
   Metal and four an invocation on Vulkan) folds onto one body when both homes profile the same on it, and

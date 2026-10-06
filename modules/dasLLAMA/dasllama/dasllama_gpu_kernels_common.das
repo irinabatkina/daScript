@@ -4,6 +4,7 @@ options gen2
 module dasllama_gpu_kernels_common shared public
 require dasllama/dasllama_lint public
 require daslib/typemacro_boost
+require math
 
 struct GkAxpyArgs {
     nelem : uint
@@ -761,6 +762,697 @@ class template GkPkAttn : GkWgReduce {
                 pp++
             }
             o[i * pa.d + h * 64u + lid] = tot
+        }
+    }
+}
+
+struct GkGatedRowsArgs {
+    d : uint        //! the output row width; the input rows are 2 d wide, the gate in their second half
+    nelem : uint    //! rows x d
+}
+
+//! the gated halves of a row, one element an invocation: FORM 0 the conv module's GLU, first . sigmoid(second) (gemma4a, the
+//! FastConformers); FORM 1 the ultravox projector's swapped SwiGLU, silu(second) . first
+[ |> template_struct_instance]
+class template GkGatedRows {
+    @template_constant FORM : int = 0
+    @ssbo @binding = 0 @role = "read" h : array<float>
+    @ssbo @binding = 1 @role = "write" y : array<float>
+    @kargs pa : GkGatedRowsArgs
+
+    def gated_rows_body {
+        let e = gl_GlobalInvocationID.x
+        if (e < pa.nelem) {
+            let dd = max(1u, pa.d)
+            let t = e / dd
+            let c = e % dd
+            let a = h[t * 2u * pa.d + c]
+            let b = h[t * 2u * pa.d + pa.d + c]
+            static_if (FORM == 0) {
+                y[e] = sig_gate(a, b)
+            } else {
+                y[e] = silu_f32(b) * a
+            }
+        }
+    }
+}
+
+struct GkLnReluRowsArgs {
+    cout : uint    //! the channels a row normalizes over
+    ldin : uint    //! x's row stride (the conv GEMM's padded width)
+    ldout : uint   //! y's row stride
+    rows : uint
+    woff : uint    //! the weight row's base in wn
+    eps : float
+}
+
+//! the subsample convs' LayerNorm over a row's channels (weight only, biased variance) then ReLU, one thread a row: y's compact
+//! rows off x's padded ones, or in place at one stride (gemma4a's front on both homes)
+[ |> template_struct_instance]
+class template GkLnReluRows {
+    @ssbo @binding = 0 @role = "read" x : array<float>
+    @ssbo @binding = 1 @role = "write" y : array<float>
+    @ssbo @binding = 2 @role = "weight" wn : array<float>
+    @kargs pa : GkLnReluRowsArgs
+
+    def ln_relu_rows_body {
+        let row = gl_GlobalInvocationID.x
+        if (row < pa.rows) {
+            let base = row * pa.ldin
+            let n = float(max(1u, pa.cout))
+            var mean = 0.0
+            for (c in urange(pa.cout)) {
+                mean += x[base + c]
+            }
+            mean /= n
+            var vv = 0.0
+            for (c in urange(pa.cout)) {
+                let dv = x[base + c] - mean
+                vv += dv * dv
+            }
+            let inv = rsqrt(vv / n + pa.eps)
+            let obase = row * pa.ldout
+            for (c in urange(pa.cout)) {
+                y[obase + c] = max((x[base + c] - mean) * inv * wn[pa.woff + c], 0.0)
+            }
+        }
+    }
+}
+
+struct GkFeatShuffleArgs {
+    w : uint         //! the frequency rows a time step keeps
+    ch : uint        //! the channels
+    t : uint         //! the time steps
+    rows_pad : uint  //! the rows written: t, or past it the GEMM's zero row pad
+}
+
+//! the subsample stack's feature rows: out[t][f + w c] = in[(t w + f) ch + c] - the [time][freq][ch] image as [time][ch][freq] rows,
+//! the rows past t zero
+[ |> template_struct_instance]
+class template GkFeatShuffle {
+    @ssbo @binding = 0 @role = "read" src : array<float>
+    @ssbo @binding = 1 @role = "write" dst : array<float>
+    @kargs pa : GkFeatShuffleArgs
+
+    def feat_shuffle_body {
+        let gid = gl_GlobalInvocationID.x
+        if (gid < pa.rows_pad * pa.w * pa.ch) {
+            let wc = max(1u, pa.w * pa.ch)
+            let w = max(1u, pa.w)
+            let t = gid / wc
+            if (t >= pa.t) {
+                dst[gid] = 0.0
+            } else {
+                let rem = gid % wc
+                let c = rem / w
+                let f = rem % w
+                dst[gid] = src[(t * pa.w + f) * pa.ch + c]
+            }
+        }
+    }
+}
+
+struct GkRelSinCosArgs {
+    d : uint         //! the row width, the (sin, cos) pairs interleaved
+    tt : uint        //! the encoder rows: the table's 2 tt - 1 rows, row w carrying the relative position tt - 1 - w
+    rows_pad : uint  //! the rows written: 2 tt - 1, or past it the GEMM's zero row pad
+}
+
+//! the Transformer-XL rel-position table [ww x d]: row w = the sinusoid of tt - 1 - w at the d / 2 frequencies, (sin, cos)
+//! interleaved - the CPU `rel_pos_table`'s form; the rows past 2 tt - 1 zero
+[ |> template_struct_instance]
+class template GkRelSinCos {
+    @ssbo @binding = 0 @role = "write" tab : array<float>
+    @kargs pa : GkRelSinCosArgs
+
+    def rel_sincos_body {
+        let gid = gl_GlobalInvocationID.x
+        let d = max(1u, pa.d)
+        if (pa.tt > 0u && gid < pa.rows_pad * pa.d) {
+            let w = gid / d
+            if (w >= 2u * pa.tt - 1u) {
+                tab[gid] = 0.0
+            } else {
+                let e = gid % d
+                let k = e / 2u
+                let rel = float(int(pa.tt) - 1 - int(w))
+                let freq = exp(-(float(k * 2u) * 9.210340371976184 / float(d)))
+                let theta = freq * rel
+                tab[gid] = (e & 1u) == 0u ? sin(theta) : cos(theta)
+            }
+        }
+    }
+}
+
+struct GkDwConv2dArgs {
+    iw : uint        //! the source block's width, height and channels ([ih x iw x ch], c fastest)
+    ih : uint
+    ih_valid : uint  //! the rows a tap may read - the length mask: the rows past them add nothing
+    ch : uint
+    woff : uint    //! the taps [ch x 9] in wn, (kh 3 + kw), or [9 x ch] under TAP_MAJOR
+    boff : uint    //! the bias row [ch] in wn
+}
+
+//! a depthwise conv2d k3 s2 p1 with its bias (the FastConformer subsample stacks), bias first, one thread an output element;
+//! a tap off the image adds nothing
+[ |> template_struct_instance]
+class template GkDwConv2d {
+    @template_constant TAP_MAJOR : bool = false
+    @ssbo @binding = 0 @role = "read" x : array<float>
+    @ssbo @binding = 1 @role = "write" y : array<float>
+    @ssbo @binding = 2 @role = "weight" wn : array<float>
+    @kargs pa : GkDwConv2dArgs
+
+    def tap2d(c, k9 : uint) : float {
+        static_if (TAP_MAJOR) {
+            return wn[pa.woff + k9 * pa.ch + c]
+        } else {
+            return wn[pa.woff + c * 9u + k9]
+        }
+    }
+
+    def dw_conv2d_body {
+        let gid = gl_GlobalInvocationID.x
+        let ch = max(1u, pa.ch)
+        let ow = (pa.iw - 1u) / 2u + 1u
+        let oh = (pa.ih - 1u) / 2u + 1u
+        if (gid < oh * ow * pa.ch) {
+            let c = gid % ch
+            let o = gid / ch
+            let oy = o / ow
+            let ox = o % ow
+            var acc = wn[pa.boff + c]
+            var kh = 0u
+            while (kh < 3u) {
+                let iy = int(oy * 2u + kh) - 1
+                if (iy >= 0 && iy < int(pa.ih_valid)) {
+                    var kw = 0u
+                    while (kw < 3u) {
+                        let ix = int(ox * 2u + kw) - 1
+                        if (ix >= 0 && ix < int(pa.iw)) {
+                            acc += tap2d(c, kh * 3u + kw) * x[(uint(iy) * pa.iw + uint(ix)) * ch + c]
+                        }
+                        kw++
+                    }
+                }
+                kh++
+            }
+            y[gid] = acc
+        }
+    }
+}
+
+let GK_G4A_ATTN_PAST = 12u   //! gemma4a's causal window - self and eleven past rows: `GkG4aAttn`'s PAST default spells it, each driver verifies the family's value against it
+let GK_G4A_ATTN_CAP = 50.0   //! gemma4a's score soft cap, verified the same way
+
+struct GkG4aAttnArgs {
+    d : uint        //! the row width (compact [npos x d] rows)
+    npos : uint
+    hs : uint       //! the head width where the stamp leaves HS at 0
+    pdsoff : uint   //! the per-dim query scale row's base in wn
+    cap : float     //! the score soft cap
+    qscale : float  //! the query scale ahead of the per-dim scale, (1 / sqrt(hs)) / log 2 - the CPU chain's log2-domain softmax
+    kscale : float  //! the key scale, log(1 + e) / log 2
+}
+
+//! gemma4a's causal sliding-window attention with the layer's projected RPE table: one invocation a (query row, head), the
+//! window sixteen rows at most (the score array; gemma4a's window is twelve), the head width the stamp's HS or `pa.hs`;
+//! the query and key scales come from the host (`gk_g4a_attn_scales`), the one rounding of them both homes share
+[ |> template_struct_instance]
+class template GkG4aAttn {
+    @template_constant HS : uint = 0u     //!< the head width served, 0 for `pa.hs`
+    @template_constant PAST : uint = 12u  //!< the causal window: `GK_G4A_ATTN_PAST`, spelled as its literal
+    @ssbo @binding = 0 @role = "read" q : array<float>
+    @ssbo @binding = 1 @role = "read" k : array<float>
+    @ssbo @binding = 2 @role = "read" v : array<float>
+    @ssbo @binding = 3 @role = "write" ao : array<float>
+    @ssbo @binding = 4 @role = "read" rpe : array<float>
+    @ssbo @binding = 5 @role = "weight" wn : array<float>
+    @kargs pa : GkG4aAttnArgs
+
+    def head_width : uint {
+        static_if (HS != 0u) {
+            return HS
+        } else {
+            return pa.hs
+        }
+    }
+
+    def g4a_attn_body {
+        let gid = gl_GlobalInvocationID.x
+        let npos = max(1u, pa.npos)
+        let i = gid % npos
+        let h = gid / npos
+        let hs = head_width()
+        if (h * hs >= pa.d) {
+            return
+        }
+        let d = pa.d
+        let hoff = h * hs
+        let qscale = pa.qscale
+        let kscale = pa.kscale
+        let j0 = i >= PAST - 1u ? i - (PAST - 1u) : 0u
+        var sarr : float[16]
+        var m = -1.5e38
+        var j = j0
+        while (j <= i) {
+            let rr = (PAST - (i - j)) * d
+            var cs = 0.0
+            var rs = 0.0
+            var n = 0u
+            while (n < hs) {
+                let qv = q[i * d + hoff + n] * qscale * wn[pa.pdsoff + n]
+                cs += qv * (k[j * d + hoff + n] * kscale)
+                rs += qv * rpe[rr + hoff + n]
+                n++
+            }
+            let sc = softcap_exp(cs + rs, pa.cap)
+            sarr[j - j0] = sc
+            m = max(m, sc)
+            j++
+        }
+        var stot = 0.0
+        j = j0
+        while (j <= i) {
+            let p = exp(sarr[j - j0] - m)
+            sarr[j - j0] = p
+            stot += p
+            j++
+        }
+        let inv = 1.0 / stot
+        var n = 0u
+        while (n < hs) {
+            var acc = 0.0
+            j = j0
+            while (j <= i) {
+                acc += sarr[j - j0] * v[j * d + hoff + n]
+                j++
+            }
+            ao[i * d + hoff + n] = acc * inv
+            n++
+        }
+    }
+}
+
+struct GkRope2dArgs {
+    nheads : uint
+    hs : uint       //! the head width: the compact row is nheads x hs wide, the rotated pairs per axis hs / 4
+    rows : uint
+}
+
+//! the 2D neox rope over q or k rows in place, the CPU `rope_neox_2d_rows`'s form: per head the x axis rotates the
+//! pairs (j, j + pairs) of its first half against the row's x table, the y axis the same pairs of its second half
+//! against the y table (one packed table row is [cx | sx | cy | sy], `pairs` each) - one thread per (row, head, pair), both axes
+[ |> template_struct_instance]
+class template GkRope2d {
+    @ssbo @binding = 0 @role = "readwrite" v : array<float>
+    @ssbo @binding = 1 @role = "read" tabs : array<float>
+    @kargs pa : GkRope2dArgs
+
+    def rope2d_body {
+        let gid = gl_GlobalInvocationID.x
+        let pairs = pa.hs / 4u
+        let d = pa.nheads * pa.hs
+        let per_row = max(1u, pa.nheads * pairs)
+        if (gid < pa.rows * per_row) {
+            let row = gid / per_row
+            let hp = gid % per_row
+            let base = row * d + (hp / max(1u, pairs)) * pa.hs
+            let j = hp % max(1u, pairs)
+            let tb = row * 4u * pairs
+            let x0 = v[base + j]
+            let x1 = v[base + j + pairs]
+            let cx = tabs[tb + j]
+            let sx = tabs[tb + pairs + j]
+            v[base + j] = x0 * cx - x1 * sx
+            v[base + j + pairs] = x0 * sx + x1 * cx
+            let yb = base + pa.hs / 2u
+            let y0 = v[yb + j]
+            let y1 = v[yb + j + pairs]
+            let cy = tabs[tb + 2u * pairs + j]
+            let sy = tabs[tb + 3u * pairs + j]
+            v[yb + j] = y0 * cy - y1 * sy
+            v[yb + j + pairs] = y0 * sy + y1 * cy
+        }
+    }
+}
+
+struct GkWdecAttnArgs {
+    dim : uint       //! a q row's width
+    tstride : uint   //! the K/V planes' positions a head
+    len0 : uint      //! the keys row 0 attends; a causal dispatch adds the row index
+    causal : uint
+    nheads : uint
+    nrows : uint
+    koff : uint      //! the layer's element base in kk / vv
+    voff : uint
+    qboff : uint     //! the q bias row's base in wn, folded at the load
+    hs : uint        //! the head width where the stamp leaves HS at 0
+    scale : float    //! the score scale, 1 / sqrt(hs)
+}
+
+//! the whisper decoder's chunked attention, the partials: one workgroup a (chunk, head, row) over 256 keys - the q bias folded
+//! into the dot, the chunk's scores staged, their max and exp-sum landed as the (m, s) slot, the unnormalized weighted V as the
+//! slot's row; the combine below merges the chunks by log-sum-exp
+[ |> template_struct_instance]
+class template GkWdecAttnPart : GkWgReduce {
+    @template_constant HS : uint = 0u   //!< the head width served, 0 for `pa.hs`
+    @ssbo @binding = 0 @role = "read" q : array<float>
+    @ssbo @binding = 1 @role = "read" kk : array<float16>
+    @ssbo @binding = 2 @role = "read" vv : array<float16>
+    @ssbo @binding = 3 @role = "write" pms : array<float>    //! [nch][heads][rows][2]: the chunk's max and sum
+    @ssbo @binding = 4 @role = "write" py : array<float>     //! [nch][heads][rows][hs]
+    @ssbo @binding = 5 @role = "weight" wn : array<float>
+    @kargs pa : GkWdecAttnArgs
+    @workgroup scores : float[256]
+
+    def wdec_head_width : uint {
+        static_if (HS != 0u) {
+            return HS
+        } else {
+            return pa.hs
+        }
+    }
+
+    def wdec_attn_part_body {
+        let hs = wdec_head_width()
+        let nhr = max(1u, pa.nheads * pa.nrows)
+        let nr = max(1u, pa.nrows)
+        let c = gl_WorkGroupID.x / nhr
+        let rem = gl_WorkGroupID.x % nhr
+        let h = rem / nr
+        let r = rem % nr
+        let lid = gl_LocalInvocationID.x
+        let len = pa.causal != 0u ? pa.len0 + r : pa.len0
+        let tb = c * 256u
+        let te = min(tb + 256u, len)
+        let nloc = te > tb ? te - tb : 0u
+        let slot = (c * pa.nheads + h) * pa.nrows + r
+        let qbase = r * pa.dim + h * hs
+        let kbase = pa.koff + h * pa.tstride * hs
+        let vbase = pa.voff + h * pa.tstride * hs
+        var t = lid
+        while (t < nloc) {
+            var s = 0.0
+            var j = 0u
+            while (j < hs) {
+                s += (q[qbase + j] + wn[pa.qboff + h * hs + j]) * float(kk[kbase + (tb + t) * hs + j])
+                s += (q[qbase + j + 1u] + wn[pa.qboff + h * hs + j + 1u]) * float(kk[kbase + (tb + t) * hs + j + 1u])
+                s += (q[qbase + j + 2u] + wn[pa.qboff + h * hs + j + 2u]) * float(kk[kbase + (tb + t) * hs + j + 2u])
+                s += (q[qbase + j + 3u] + wn[pa.qboff + h * hs + j + 3u]) * float(kk[kbase + (tb + t) * hs + j + 3u])
+                j += 4u
+            }
+            scores[t] = s * pa.scale
+            t += gl_WorkGroupSize.x
+        }
+        barrier()
+        var mx = -3.0e38
+        t = lid
+        while (t < nloc) {
+            mx = max(mx, scores[t])
+            t += gl_WorkGroupSize.x
+        }
+        var m = 0.0
+        wg_max_into(mx, 0u, m)
+        var ss = 0.0
+        t = lid
+        while (t < nloc) {
+            let e = exp(scores[t] - m)
+            scores[t] = e
+            ss += e
+            t += gl_WorkGroupSize.x
+        }
+        var tot = 0.0
+        wg_sum_into(ss, 1u, tot)   //! its barrier also lands every lane's exponentials before the output loop reads them across lanes
+        if (lid == 0u) {
+            pms[slot * 2u] = nloc > 0u ? m : -3.0e38
+            pms[slot * 2u + 1u] = tot
+        }
+        var j = lid
+        while (j < hs) {
+            var acc = 0.0
+            var tt = 0u
+            while (tt < nloc) {
+                acc += scores[tt] * float(vv[vbase + (tb + tt) * hs + j])
+                tt++
+            }
+            py[slot * hs + j] = acc
+            j += gl_WorkGroupSize.x
+        }
+    }
+}
+
+struct GkWdecCombArgs {
+    dim : uint
+    nchunks : uint
+    nheads : uint
+    nrows : uint
+    hs : uint        //! the head width where the stamp leaves HS at 0
+}
+
+//! the chunked attention's combine over one row's head slice: the chunks' (m, s) slots merged by log-sum-exp, the lanes
+//! striding the head's columns
+[ |> template_struct_instance]
+class template GkWdecAttnComb {
+    @template_constant HS : uint = 0u   //!< the head width served, 0 for `pa.hs`
+    @ssbo @binding = 0 @role = "read" pms : array<float>
+    @ssbo @binding = 1 @role = "read" py : array<float>
+    @ssbo @binding = 2 @role = "write" y : array<float>
+    @kargs pa : GkWdecCombArgs
+
+    def comb_head_width : uint {
+        static_if (HS != 0u) {
+            return HS
+        } else {
+            return pa.hs
+        }
+    }
+
+    def wdec_attn_comb_body {
+        let hs = comb_head_width()
+        let nr = max(1u, pa.nrows)
+        let h = gl_WorkGroupID.x / nr
+        let r = gl_WorkGroupID.x % nr
+        let lid = gl_LocalInvocationID.x
+        var mg = -3.0e38
+        var c = 0u
+        while (c < pa.nchunks) {
+            mg = max(mg, pms[((c * pa.nheads + h) * pa.nrows + r) * 2u])
+            c++
+        }
+        var tot = 0.0
+        c = 0u
+        while (c < pa.nchunks) {
+            let slot = (c * pa.nheads + h) * pa.nrows + r
+            tot += pms[slot * 2u + 1u] * exp(pms[slot * 2u] - mg)
+            c++
+        }
+        let inv = 1.0 / max(tot, 1.0e-30)
+        var j = lid
+        while (j < hs) {
+            var acc = 0.0
+            c = 0u
+            while (c < pa.nchunks) {
+                let slot = (c * pa.nheads + h) * pa.nrows + r
+                acc += py[slot * hs + j] * exp(pms[slot * 2u] - mg)
+                c++
+            }
+            y[r * pa.dim + h * hs + j] = acc * inv
+            j += gl_WorkGroupSize.x
+        }
+    }
+}
+
+//! gemma4a's attention scales as the CPU chain rounds them: the query scale ahead of the per-dim scale and the key scale, both
+//! into the log2-domain softmax
+def gk_g4a_attn_scales(hs : int64) : tuple<qscale : float; kscale : float> {
+    return (qscale = (1.0 / sqrt(float(hs))) / log(2.0), kscale = log(1.0 + exp(1.0)) / log(2.0))
+}
+
+struct GkRestrideArgs {
+    rows : uint
+    rows_pad : uint //! the padded panel's row cap (the scratch's, a multiple of the l column - `vt_cap_rows`): PAD writes zero rows past `rows` up to it, the unpad reads `rows`
+    nheads : uint
+    hs : uint
+    hsp : uint
+    sstride : uint  //! the compact rows' stride and the column their heads start at (a fused [q | k | v] row: 3d and 0 / d / 2d)
+    soff : uint
+    boff : uint     //! the BIAS stamps: the projection's bias row in wn, added as the compact row is read
+    doff : uint     //! the padded panel's element base in its binding (the pad direction)
+}
+
+//! the head restride between the compact rows [rows x heads x hs] (at `sstride` / `soff`) and the attention tile's padded panel
+//! [rows_pad x heads x hsp], one thread an element of the padded space: PAD writes the panel at `doff` with zero lanes and zero rows
+//! past `rows` (f16 saturated under OUT16, the BIAS stamps adding the bias row as they read); the other way reads the compact rows back
+[ |> template_struct_instance]
+class template GkRestride {
+    @template_constant PAD : bool = true
+    @template_constant OUT16 : bool = false
+    @template_constant OUT32 : bool = true   //! the f32 destination's gate: the f16 stamp clears it as it sets OUT16
+    @template_constant BIAS : bool = false   //! the pad adds the bias row at `boff` (the whisper-class q / k / v biases fold into the restride)
+    @ssbo @binding = 0 @role = "read" src : array<float>
+    @ssbo @binding = 1 @role = "write" @template_gate = OUT32 dst : array<float>
+    @ssbo @binding = 2 @role = "write" @template_gate = OUT16 dsth : array<float16>
+    @ssbo @binding = 3 @role = "weight" @template_gate = BIAS wn : array<float>
+    @kargs pa : GkRestrideArgs
+
+    def restride_body {
+        let gid = gl_GlobalInvocationID.x
+        let per_row = pa.nheads * pa.hsp
+        let rows_out = PAD ? pa.rows_pad : pa.rows
+        if (gid < rows_out * per_row) {
+            let row = gid / per_row
+            let hp = gid % per_row
+            let head = hp / pa.hsp
+            let lane = hp % pa.hsp
+            let ci = row * pa.sstride + pa.soff + head * pa.hs + lane
+            static_if (PAD) {
+                var v = 0.0
+                if (lane < pa.hs && row < pa.rows) {
+                    v = src[ci]
+                    static_if (BIAS) {
+                        v += wn[pa.boff + head * pa.hs + lane]
+                    }
+                }
+                static_if (OUT16) {
+                    dsth[pa.doff + gid] = half_sat(v)
+                } else {
+                    dst[pa.doff + gid] = v
+                }
+            } else {
+                if (lane < pa.hs) {
+                    static_if (OUT16) {
+                        dsth[ci] = half_sat(src[gid])
+                    } else {
+                        dst[ci] = src[gid]
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+struct GkMelNormArgs {
+    n_mel : uint
+    n_frames : uint   //! the frames the mel holds
+    valid : uint      //! the real frames: the statistics run over them, the frames past them read zero
+    mfloor : float    //! the LOG_IN stamp's log guard
+}
+
+//! canary's per-feature normalization of a frame-major mel in place, one thread a mel column: the column's mean and unbiased
+//! deviation over the valid frames, every valid frame normalized, the tail frames zero; the LOG_IN stamp takes the log of
+//! the mel sums first (Metal's mel GEMM leaves the sums, Vulkan's mel kernel the logs)
+[ |> template_struct_instance]
+class template GkMelNorm {
+    @template_constant LOG_IN : bool = false
+    @ssbo @binding = 0 @role = "readwrite" mel : array<float>
+    @kargs pa : GkMelNormArgs
+
+    def mel_norm_body {
+        let j = gl_GlobalInvocationID.x
+        if (j < pa.n_mel) {
+            let nm = pa.n_mel
+            var sum = 0.0
+            for (i in urange(pa.valid)) {
+                static_if (LOG_IN) {
+                    let v = log(mel[i * nm + j] + pa.mfloor)
+                    mel[i * nm + j] = v
+                    sum += v
+                } else {
+                    sum += mel[i * nm + j]
+                }
+            }
+            let mean = sum / float(max(1u, pa.valid))
+            var sq = 0.0
+            for (i in urange(pa.valid)) {
+                let dv = mel[i * nm + j] - mean
+                sq += dv * dv
+            }
+            let denom = sqrt(sq / max(float(pa.valid) - 1.0, 1.0)) + 1e-5
+            for (i in urange(pa.valid)) {
+                mel[i * nm + j] = (mel[i * nm + j] - mean) / denom
+            }
+            for (i in urange(pa.valid, pa.n_frames)) {
+                mel[i * nm + j] = 0.0
+            }
+        }
+    }
+}
+
+struct GkQ3aShuffleArgs {
+    nch : uint          //! the conv channel count
+    ncp : uint          //! a conv3 row's stride (the channels, or Metal's 64-padded ones)
+    chunk_stride : uint //! a chunk's elements in y3 (16 x 13 rows of ncp, or Metal's row-padded chunk)
+    npos : uint         //! the window's positions
+}
+
+//! the qwen3a feature rows off the third conv stage, the conv_out GEMM's feed: feat[ci][ow][h + 16 c] = y3[ci][(h x 13 + ow) x ncp + c],
+//! thirteen positions a chunk; the stamp names the feed's element type `OT` (the f16 tile's halves, the f32 tile's floats)
+[ |> template_struct_instance]
+class template GkQ3aShuffle {
+    @ssbo @binding = 0 @role = "read" y3 : array<float>
+    @ssbo @binding = 1 @role = "write" feat : array<OT>
+    @kargs pa : GkQ3aShuffleArgs
+
+    def q3a_shuffle_body {
+        let gid = gl_GlobalInvocationID.x
+        let feat_w = max(1u, 16u * pa.nch)
+        if (gid < pa.npos * feat_w) {
+            let tok = 13u
+            let row = gid / feat_w
+            let j = gid % feat_w
+            let h = j % 16u
+            let c = j / 16u
+            let ci = row / tok
+            let ow = row % tok
+            feat[gid] = OT(y3[ci * pa.chunk_stride + (h * tok + ow) * pa.ncp + c])   // nolint:PERF020,LINT019 — the f16 stamp narrows here; on the f32 stamp the cast is the identity
+        }
+    }
+}
+
+struct GkIm2col2dArgs {
+    iw : uint         //! the source block's width (frames), height (mel rows / channels' rows) and channel count
+    ih : uint
+    cin : uint
+    sstride : uint    //! a source pixel's stride: cin, or the padded channel rows a GEMM wrote
+    kdp : uint        //! the column row's padded width, a tile multiple; the columns past cin x 9 read zero
+    rows : uint       //! the output rows of every chunk: chunks x oh x ow
+    soff : uint       //! the source's element base in its binding
+}
+
+//! the im2col of a k3 s2 p1 conv2d over a window's chunks, the conv GEMM's feed: row r = (chunk, oy, ox), column k = (ic x 3 + kh)
+//! x 3 + kw - the file's weight order, so the weights need no permute; the source rows are [chunk][ih][iw][sstride]; the stamp
+//! names the feed's element type `OT`
+[ |> template_struct_instance]
+class template GkIm2col2d {
+    @ssbo @binding = 0 @role = "read" src : array<float>
+    @ssbo @binding = 1 @role = "write" col : array<OT>
+    @kargs pa : GkIm2col2dArgs
+
+    def im2col2d_body {
+        let gid = gl_GlobalInvocationID.x
+        let kdp = max(1u, pa.kdp)
+        if (gid < pa.rows * kdp) {
+            let r = gid / kdp
+            let k = gid % kdp
+            var v = 0.0
+            if (k < pa.cin * 9u) {
+                let ow = (pa.iw - 1u) / 2u + 1u
+                let oh = (pa.ih - 1u) / 2u + 1u
+                let per_chunk = max(1u, oh * ow)
+                let ci = r / per_chunk
+                let rr = r % per_chunk
+                let ic = k / 9u
+                let kh = (k % 9u) / 3u
+                let kw = k % 3u
+                let iy = int((rr / ow) * 2u + kh) - 1
+                let ix = int((rr % ow) * 2u + kw) - 1
+                if (iy >= 0 && iy < int(pa.ih) && ix >= 0 && ix < int(pa.iw)) {
+                    v = src[pa.soff + ci * (pa.ih * pa.iw * pa.sstride) + (uint(iy) * pa.iw + uint(ix)) * pa.sstride + ic]
+                }
+            }
+            col[gid] = OT(v)   // nolint:PERF020,LINT019 — the f16 stamp narrows here; on the f32 stamp the cast is the identity
         }
     }
 }
