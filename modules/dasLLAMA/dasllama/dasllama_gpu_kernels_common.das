@@ -797,6 +797,27 @@ class template GkGatedRows {
     }
 }
 
+struct GkPoolRowsArgs {
+    width : uint   //! the OUTPUT row's width
+    total : uint   //! output elements
+}
+
+//! the whisper-class projector tails' pair pool: y [rows x width] the mean of x's row pairs [2 rows x width]
+[ |> template_struct_instance]
+class template GkPoolRows {
+    @ssbo @binding = 0 @role = "read" x : array<float>
+    @ssbo @binding = 1 @role = "write" y : array<float>
+    @kargs pa : GkPoolRowsArgs
+
+    def pool_rows_body {
+        let e = gl_GlobalInvocationID.x
+        if (e < pa.total) {
+            let at = (e / pa.width) * 2u * pa.width + e % pa.width
+            y[e] = 0.5 * (x[at] + x[at + pa.width])
+        }
+    }
+}
+
 struct GkLnReluRowsArgs {
     cout : uint    //! the channels a row normalizes over
     ldin : uint    //! x's row stride (the conv GEMM's padded width)

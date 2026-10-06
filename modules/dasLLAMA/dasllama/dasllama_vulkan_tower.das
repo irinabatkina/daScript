@@ -77,6 +77,20 @@ def set_vulkan_audio_blocks(on : bool) {
     g_vt_env_audio_blocks = on
 }
 
+var private g_vt_env_tail = true
+var private g_vt_tail_encodes = 0l
+
+//! Test A/B seat: the chat projector tail behind the whisper-class blocks on the device (`vulkan_audio_tower_blocks_tail`); off,
+//! the blocks still serve and the CPU tail reads their rows
+def set_vulkan_tower_tail(on : bool) {
+    g_vt_env_tail = on
+}
+
+def vulkan_tower_tail_knob : bool => g_vt_env_tail
+
+//! the encodes whose projector tail the device ran (the soft tokens read back, the blocks' rows never)
+def vulkan_tower_tail_encodes : int64 => g_vt_tail_encodes
+
 def vulkan_tower_on : bool => g_vt_env_tower
 
 //! The fronts' route: the audio fronts ride the f16 GEMM feed (cm2 or KHR); off it (the sdot4 mode) every front declines
@@ -119,6 +133,8 @@ let private VT_REL_TAB = 0x800000u
 let private VT_TAIL_OUT = 0x8000000u       //! gemma4a's projector tail: the out-proj rows, the projected rows
 let private VT_TAIL_PROJ = 0x10000000u
 let private VT_SPLITK_PLANES = 0x20000000u      //! the pre-LN chain's split-k partial planes (the fc2 GEMM's k chunks before the reduce)
+let private VT_CT_HID = 0x40000000u      //! the chat projector tail: the MLP's hidden rows, the gated rows
+let private VT_CT_GATE = 0x80000000u
 let private VT_SPLITK_MAX_PLANES = 8l   //! the most k chunks a chain GEMM splits into - the pick's own range
 let private VT_SK_MIN_ROWS = 512l       //! the rows under which no split serves: a 128-row window reads 5% slower split (PERF_LEDGER.md's split-k row)
 let private VT_MEL_FLOOR = 5.960464477539063e-08   //! 2^-24, the whisper-class log-mel's floor (the CPU fronts' own)
@@ -326,6 +342,25 @@ struct private VtResident {
     s_feed_pt : VkDescriptorSet
     s_bias_pt : VkDescriptorSet
     s_rms_pt : VkDescriptorSet
+    ct_cap : int64            //! the chat projector tail's row capacity (the whisper-class chat towers; 0 = none) and its plane widths
+    ct_hid : int64
+    ct_gate : int64
+    ct_out : int64
+    ct_hid_dev : uint64
+    ct_gate_dev : uint64
+    ct_out_dev : uint64
+    ct_host : HostBuf
+    s_ct_pool : VkDescriptorSet
+    s_ct_ln : VkDescriptorSet
+    s_ct_ln16 : VkDescriptorSet
+    s_ct_rms_xb : VkDescriptorSet
+    s_ct_rms_gate : VkDescriptorSet
+    s_ct_feed_xb : VkDescriptorSet
+    s_ct_feed_hid : VkDescriptorSet
+    s_ct_feed_gate : VkDescriptorSet
+    s_ct_swiglu : VkDescriptorSet
+    s_ct_gelu : VkDescriptorSet
+    s_ct_bias_out : VkDescriptorSet
     s_ln16 : VkDescriptorSet
     s_post_o_ln16 : VkDescriptorSet
     s_post_d_ln16 : VkDescriptorSet
@@ -534,6 +569,7 @@ def private vt_release_scratch(var r : VtResident) {
         }
     }
     vt_tail_release(r)
+    vt_ct_release(r)
     destroy_host_buf(r.host)
     if (r.meta_bytes > 0l) {
         destroy_host_buf(r.meta)
@@ -560,6 +596,7 @@ def private vt_forget_scratch(var r : VtResident) {
     r.sk_bytes = 0l
     r.tail_cap = 0l
     r.tail_dim = 0l
+    r.ct_cap = 0l
     r.cn_plane_rows = 0l
     r.sets_d |> clear()
     r.sets_ff |> clear()
@@ -1896,9 +1933,11 @@ def private vt_ln_regions(o : LayerOffs; d, ff : int64; var out : VtRegion[int(V
 
 [cold_path]
 def private vt_upload_ln(var r : VtResident; key : uint64; qblob : PlaneI8; qscales : PlaneF; d, ff : int64;
-                         blob : PlaneF; rows_off, rows_n : int64; lay : Q8RepackLayout; offs : array<LayerOffs>; conv2_w : int64 = -1l) : bool {
+                         blob : PlaneF; rows_off, rows_n : int64; lay : Q8RepackLayout; offs : array<LayerOffs>; conv2_w : int64 = -1l;
+                         proj : array<VtRegion> = g_vt_no_regions) : bool {
     var regions : array<VtRegion>
-    regions |> reserve(long_length(offs) * VT_LN_GEMMS + 1l)
+    regions |> reserve(long_length(offs) * VT_LN_GEMMS + 1l + long_length(proj))
+    regions |> push_from(proj)
     if (conv2_w >= 0l) {
         regions |> push(VtRegion(woff = conv2_w, n = 3l * d, rows = d))
     }
@@ -1973,8 +2012,8 @@ def private vt_sk_build(var r : VtResident; nsplit, need : int64) : bool {
     return true
 }
 
-def private vt_ln_scratch(var r : VtResident; nl, npos, d, ff, hs, dp, g_d, g_ff : int64; khr, cm2 : bool; tc_d, tc_ff : int64; v, vff : int) : bool {
-    let meta_bytes = vt_ln_meta_bytes(nl, g_d, g_ff, vt_ln_fc2_groups(d, ff, npos, tc_d, cm2, g_d))
+def private vt_ln_scratch(var r : VtResident; nl, npos, d, ff, hs, dp, g_d, g_ff : int64; khr, cm2 : bool; tc_d, tc_ff : int64; v, vff : int; extra_meta : int64) : bool {
+    let meta_bytes = vt_ln_meta_bytes(nl, g_d, g_ff, vt_ln_fc2_groups(d, ff, npos, tc_d, cm2, g_d)) + extra_meta
     if (!vt_scratch_fits(r, npos, d, ff, dp, meta_bytes, khr, false, 0l)) {
         if (!vt_scratch_build(r, npos, d, ff, hs, dp, meta_bytes, khr, false, 0l)) {
             return false
@@ -1990,7 +2029,8 @@ def private vt_ln_scratch(var r : VtResident; nl, npos, d, ff, hs, dp, g_d, g_ff
 [arch(at = "../ARCHITECTURE_GPU_TOWER_VULKAN.md#vk-tower-encode-chains")]
 def private vt_ln_chain(var r : VtResident; offs : array<LayerOffs>; k_bias : bool; fc1_act : uint; eps : float;   // nolint:STYLE038 — the dispatch chain is the shape
                         norms_base, d, ff, hs, hsp, nheads, npos : int64; khr : bool; v, vff : int; var x : array<float>;
-                        lnp_w : int64 = -1l; lnp_b : int64 = -1l; var xb : array<float>& = g_vt_no_rows) : bool {
+                        lnp_w : int64 = -1l; lnp_b : int64 = -1l; var xb : array<float>& = g_vt_no_rows; var tl : VtChatTail = VtChatTail();
+                        var out : array<float>& = g_vt_no_rows) : bool {
     let ln_post = lnp_w >= 0l
     let q8e = kq_elems(KqFmt.q8)
     let nl = long_length(offs)
@@ -2003,13 +2043,17 @@ def private vt_ln_chain(var r : VtResident; offs : array<LayerOffs>; k_bias : bo
     }
     let g_d = cm2 ? cm2_tiles_at(d, npos, tc_d) : vt_gemm_groups(d, npos)
     let g_ff = cm2 ? cm2_tiles_at(ff, npos, tc_ff) : vt_gemm_groups(ff, npos)
-    let nrec = nl * VT_LN_GEMMS
+    let nrec_blocks = nl * VT_LN_GEMMS
+    let nrec = nrec_blocks + vt_ct_gemms(tl)
     var sk = vt_ln_fc2_pick(d, ff, npos, vt_cap_rows(npos), tc_d, cm2)
-    if (!vt_ln_scratch(r, nl, npos, d, ff, hs, dp, g_d, g_ff, khr, cm2, tc_d, tc_ff, v, vff)) {
+    if (!vt_ln_scratch(r, nl, npos, d, ff, hs, dp, g_d, g_ff, khr, cm2, tc_d, tc_ff, v, vff, vt_ct_meta_bytes(tl))) {
         return vt_flush_and_decline(r, VulkanTowerDecline.memory)
     }
     if (sk.nsplit > 1l && !vt_sk_ensure(r, sk.tc, sk.nsplit)) {
         sk = (tc = tc_d, nsplit = 1l, ksplit = 0l)
+    }
+    if (tl.on && !vt_ct_ready(r, tl)) {
+        return vt_flush_and_decline(r, VulkanTowerDecline.memory)
     }
     let split = sk.nsplit > 1l
     let g_fc2 = split ? cm2_tiles_at(d, npos, sk.tc) * sk.nsplit : g_d
@@ -2019,6 +2063,10 @@ def private vt_ln_chain(var r : VtResident; offs : array<LayerOffs>; k_bias : bo
     let tile_fc2 = VtTile(v = v, tc = cm2 ? sk.tc : 0l)
     var recs : VtRegion[int(VT_LN_GEMMS)]
     vt_sched_walk(g_vt_maps, r.meta, nrec) $(rid : int64) : VtSchedRec {
+        if (rid >= nrec_blocks) {
+            let second = rid > nrec_blocks
+            return VtSchedRec(wblk0 = (second ? tl.w2 : tl.w1) / q8e, rows = vt_tile_rows(second ? tl.tile2 : tl.tile1, tl.rows), groups = second ? tl.g2 : tl.g1)
+        }
         let g = rid % VT_LN_GEMMS
         if (g == 0l) {
             vt_ln_regions(offs[rid / VT_LN_GEMMS], d, ff, recs)
@@ -2169,9 +2217,19 @@ def private vt_ln_chain(var r : VtResident; offs : array<LayerOffs>; k_bias : bo
             }
             vt_pt(raw, VtProfRole.post_add)
         }
-        vhz_dep(raw, h, ln_post ? VT_XB : VT_X, 0u, true)
-        cmd_copy_range(raw, ln_post ? r.xb_dev : r.x_dev, 0l, r.host.buf, 0l, bx)
+        if (tl.on) {
+            vt_ct_enc(raw, h, r, tl, d, nrec_blocks, cm2)
+            vhz_dep(raw, h, VT_TAIL_OUT, 0u, true)
+            cmd_copy_range(raw, r.ct_out_dev, 0l, r.ct_host.buf, 0l, tl.rows * tl.out * 4l)
+        } else {
+            vhz_dep(raw, h, ln_post ? VT_XB : VT_X, 0u, true)
+            cmd_copy_range(raw, ln_post ? r.xb_dev : r.x_dev, 0l, r.host.buf, 0l, bx)
+        }
         vt_pt(raw, VtProfRole.copy_out)
+    }
+    if (tl.on) {
+        g_vt_tail_encodes++
+        return vt_served_from(r, r.ct_host, out, tl.rows * tl.out * 4l, npos, nl)
     }
     if (ln_post) {
         g_vt_aud_out_ptr = intptr(unsafe(addr(xb[0])))
@@ -2182,7 +2240,8 @@ def private vt_ln_chain(var r : VtResident; offs : array<LayerOffs>; k_bias : bo
     return vt_served(r, x, bx, npos, nl)
 }
 
-var private g_vt_no_rows : array<float>   //! the chain's xb default where no post-norm lands
+var private g_vt_no_rows : array<float>   //! the chain's xb default where no post-norm lands, its out default where no tail
+var private g_vt_no_regions : array<VtRegion>   //! the upload's projector default where a tower has none
 var private g_vt_aud_out_ptr = 0ul   //! the encoder-output handoff: the served post-norm chain's `xb` rows still on the device (`bytes` = 0: none) - every audio hook entry clears it, so it names the encode in flight alone
 var private g_vt_aud_out_bytes = 0l
 var private g_vt_aud_out_dev = 0ul
@@ -2214,8 +2273,261 @@ def private vt_flush_and_decline(var r : VtResident; why : VulkanTowerDecline) :
     return vt_decline(r, why)
 }
 
+//! the chat projector tail behind the whisper-class blocks: what the chain dispatches after its last block (`vt_ct_enc`), the
+//! CPU tail's steps at its widths (`audio_encode`), on the record the hook prepares per encode
+struct private VtChatTail {
+    on : bool
+    kind : AudioProjKind
+    rows : int64        //! the soft tokens a chunk
+    pool_rows : int64   //! the rows the post-norm reads: the pooled pairs (qwen2a, voxtral), every position (ultravox)
+    m1in : int64        //! the first GEMM's K - the stacked row
+    n1out : int64       //! its width
+    m2in : int64        //! the second GEMM's K (0 = one GEMM)
+    out : int64         //! the soft tokens' width
+    tile1 : VtTile
+    tile2 : VtTile
+    g1 : int64
+    g2 : int64
+    w1 : int64          //! the GEMMs' weight offsets in the q8 plane
+    w2 : int64
+    lnoff : uint        //! the post-norm rows, the ultravox norm rows and qwen2a's bias row in the norms plane
+    lnboff : uint
+    normpre : uint
+    normmid : uint
+    proj_b : uint
+    eps : float
+    s_mm1 : VkDescriptorSet
+    s_mm2 : VkDescriptorSet
+}
+
+let private VT_CT_RMS_EPS = 1e-6   //! the ultravox norms' own eps, not the tower's
+let private VT_CT_MM1_KEY = 8000   //! the chat tail's GEMM sets in `sets_front`: mm1 at this + the tile key, mm2 at the next base
+let private VT_CT_MM2_KEY = 9500
+
+def private vt_ct_m2in(t : AudioTower) : int64 => t.proj_kind == AudioProjKind.ultravox ? t.mm1_out / 2l : t.mm1_out
+
+//! the tail's GEMMs on the q8 plane at the tiles' lattice: every K and N a 64-multiple (a K a 32-multiple is what `tower_quantize_`
+//! quantizes, so these planes are q8 on a q8 tower)
+def private vt_ct_planes_ok(t : AudioTower) : bool {
+    return false if (t.proj_dim <= 0l || t.proj_dim % 64l != 0l)
+    return true if (t.proj_kind == AudioProjKind.qwen2a)
+    return (t.d_model * t.stack_factor) % 64l == 0l && t.mm1_out % 64l == 0l && vt_ct_m2in(t) % 64l == 0l
+}
+
+//! whether this encode's tail rides the chain: the planes, the pooled rows even and whole stacks, the feeds inside the scratch
+def private vt_ct_shape_ok(t : AudioTower; npos : int64) : bool {
+    return false if (!vt_ct_planes_ok(t))
+    let pool = t.proj_kind != AudioProjKind.ultravox
+    let rows_in = pool ? npos / 2l : npos
+    let rows = rows_in / t.stack_factor
+    let m1in = t.d_model * t.stack_factor
+    return ((!pool || npos % 2l == 0l) && rows_in % t.stack_factor == 0l && rows > 0l
+        && vt_cap_rows(rows) * max(m1in, vt_ct_m2in(t)) <= vt_cap_rows(npos) * max(t.d_model, t.n_ff))
+}
+
+//! the projector planes the upload gathers beside the block records, in the repack's (K, rows) shape
+[cold_path]
+def private vt_ct_regions(t : AudioTower; var regions : array<VtRegion>) {
+    return if (!vt_ct_planes_ok(t))
+    if (t.proj_kind == AudioProjKind.qwen2a) {
+        regions |> push(VtRegion(woff = t.proj_w_off, n = t.d_model, rows = t.proj_dim))
+        return
+    }
+    regions |> push(VtRegion(woff = t.proj_w_off, n = t.d_model * t.stack_factor, rows = t.mm1_out))
+    regions |> push(VtRegion(woff = t.mm2_w_off, n = vt_ct_m2in(t), rows = t.proj_dim))
+}
+
+//! this encode's tail record: the row counts, the GEMM tiles and groups, the norms-plane offsets; `on` false where a class refused
+//! (the blocks alone serve, the CPU tail reads their rows)
+def private vt_ct_prepare(t : AudioTower; npos : int64; cm2 : bool) : VtChatTail {
+    var ct = VtChatTail(kind = t.proj_kind, eps = t.eps, out = t.proj_dim, w1 = t.proj_w_off, w2 = t.mm2_w_off)
+    let uv = t.proj_kind == AudioProjKind.ultravox
+    let one = t.proj_kind == AudioProjKind.qwen2a
+    ct.pool_rows = uv ? npos : npos / 2l
+    ct.rows = ct.pool_rows / t.stack_factor
+    ct.m1in = t.d_model * t.stack_factor
+    ct.n1out = one ? t.proj_dim : t.mm1_out
+    ct.m2in = one ? 0l : vt_ct_m2in(t)
+    ct.lnoff = uint(t.lnp_w_off - t.layers_off)
+    ct.lnboff = uint(t.lnp_b_off - t.layers_off)
+    ct.normpre = uint(t.normpre_off - t.layers_off)
+    ct.normmid = uint(t.normmid_off - t.layers_off)
+    ct.proj_b = uint(t.proj_b_off - t.layers_off)
+    ct.tile1 = vt_tile(cm2, ct.n1out, ct.rows)
+    ct.tile2 = one ? ct.tile1 : vt_tile(cm2, ct.out, ct.rows)
+    ct.g1 = vt_tile_groups(ct.tile1, ct.n1out, ct.rows)
+    ct.g2 = one ? 0l : vt_tile_groups(ct.tile2, ct.out, ct.rows)
+    let feed_ok = cm2 ? (ensure_tower_ln16_cls() && ensure_tower_clamp_cvt_cls()) : ensure_tower_clamp_rq_cls()
+    ct.on = (vt_tile_ensure(ct.tile1) && vt_tile_ensure(ct.tile2) && ensure_tower_pool_rows_cls() && ensure_tower_ln_cls()
+        && ensure_tower_bias_act_cls() && ensure_hc_norm_cls() && ensure_tower_swiglu_swapped_cls() && ensure_tower_act_cls() && feed_ok)
+    if (!ct.on) {
+        vt_ct_stand_down(t.proj_kind)
+    }
+    return ct
+}
+
+[cold_path]
+def private vt_ct_stand_down(kind : AudioProjKind) {
+    to_log(LOG_INFO, "dasLLAMA vulkan tower: the {kind} projector tail stands down - a class failed to build; the blocks serve\n")
+}
+
+def private vt_ct_gemms(ct : VtChatTail) : int64 => ct.on ? (ct.m2in > 0l ? 2l : 1l) : 0l
+
+//! the tail's share of the schedule buffer: its records' four words and a map word a group
+def private vt_ct_meta_bytes(ct : VtChatTail) : int64 => (vt_ct_gemms(ct) * 4l + ct.g1 + ct.g2) * 4l
+
+[cold_path]
+def private vt_ct_release(var r : VtResident) {
+    if (r.ct_cap > 0l) {
+        destroy_device_buf(r.ct_hid_dev)
+        destroy_device_buf(r.ct_gate_dev)
+        destroy_device_buf(r.ct_out_dev)
+        destroy_host_buf(r.ct_host)
+        r.ct_cap = 0l
+    }
+}
+
+//! the tail's planes at the scratch's capacity - the hidden rows, the gated rows, the soft tokens and their readback - and the
+//! row sets over them and the chain's x / xb planes; a rebuild drops the GEMM sets cached over the old planes
+[cold_path]
+def private vt_ct_bufs(var r : VtResident; hid, gate, out : int64) : bool {
+    vt_ct_release(r)
+    var stale <- [for (k in keys(r.sets_front)); k; where k >= VT_CT_MM1_KEY]
+    for (k in stale) {
+        r.sets_front |> erase(k)
+    }
+    let cap = r.cap_rows
+    let bx = cap * r.d * 4l
+    let bq = cap * max(r.d, r.ff)
+    let bs = bq / kq_elems(KqFmt.q8) * 4l
+    let bxh = (cap + TILE_READ_SLACK) * max(r.d, r.ff) * 2l
+    let bh = cap * max(hid, 1l) * 4l
+    let bg = cap * max(gate, 1l) * 4l
+    let bo = cap * out * 4l
+    r.oom = false
+    r.ct_hid_dev = vt_dev_buf(r, bh)
+    r.ct_gate_dev = vt_dev_buf(r, bg)
+    r.ct_out_dev = vt_dev_buf(r, bo)
+    r.ct_host = vt_host_buf(r, bo, true)
+    r.ct_cap = cap
+    r.ct_hid = hid
+    r.ct_gate = gate
+    r.ct_out = out
+    if (r.oom) {
+        vt_ct_release(r)
+        return false
+    }
+    r.s_ct_pool = set_tower_pool_rows_cls(fixed_array(r.x_dev, r.yo_dev), fixed_array(bx, bx), fixed_array(VT_X, VT_YO))
+    r.s_ct_ln = set_tower_ln_cls(fixed_array(r.yo_dev, r.xb_dev, r.norms_dev), fixed_array(bx, bx, r.norms_bytes), fixed_array(VT_YO, VT_XB, 0u))
+    r.s_ct_rms_xb = set_hc_norm_cls(fixed_array(r.xb_dev, r.xb_dev, r.norms_dev), fixed_array(bx, bx, r.norms_bytes), fixed_array(VT_XB, VT_XB, 0u))
+    r.s_ct_rms_gate = set_hc_norm_cls(fixed_array(r.ct_gate_dev, r.ct_gate_dev, r.norms_dev), fixed_array(bg, bg, r.norms_bytes), fixed_array(VT_CT_GATE, VT_CT_GATE, 0u))
+    r.s_ct_swiglu = set_tower_swiglu_swapped_cls(fixed_array(r.ct_hid_dev, r.ct_gate_dev), fixed_array(bh, bg), fixed_array(VT_CT_HID, VT_CT_GATE))
+    r.s_ct_gelu = set_tower_act_cls(fixed_array(r.ct_hid_dev), fixed_array(bh), fixed_array(VT_CT_HID))
+    r.s_ct_bias_out = set_tower_bias_act_cls(fixed_array(r.ct_out_dev, r.norms_dev), fixed_array(bo, r.norms_bytes), fixed_array(VT_TAIL_OUT, 0u))
+    if (r.cm2) {
+        r.s_ct_ln16 = set_tower_ln16_cls(fixed_array(r.yo_dev, r.norms_dev, r.xh_dev), fixed_array(bx, r.norms_bytes, bxh), fixed_array(VT_YO, 0u, VT_XQ))
+        r.s_ct_feed_xb = set_tower_clamp_cvt_cls(fixed_array(r.xb_dev, r.xh_dev), fixed_array(bx, bxh), fixed_array(VT_XB, VT_XQ))
+        r.s_ct_feed_hid = set_tower_clamp_cvt_cls(fixed_array(r.ct_hid_dev, r.xh_dev), fixed_array(bh, bxh), fixed_array(VT_CT_HID, VT_XQ))
+        r.s_ct_feed_gate = set_tower_clamp_cvt_cls(fixed_array(r.ct_gate_dev, r.xh_dev), fixed_array(bg, bxh), fixed_array(VT_CT_GATE, VT_XQ))
+    } else {
+        r.s_ct_feed_xb = set_tower_clamp_rq_cls(fixed_array(r.xb_dev, r.xq_dev, r.xs_dev), fixed_array(bx, bq, bs), fixed_array(VT_XB, VT_XQ, VT_XQ))
+        r.s_ct_feed_hid = set_tower_clamp_rq_cls(fixed_array(r.ct_hid_dev, r.xq_dev, r.xs_dev), fixed_array(bh, bq, bs), fixed_array(VT_CT_HID, VT_XQ, VT_XQ))
+        r.s_ct_feed_gate = set_tower_clamp_rq_cls(fixed_array(r.ct_gate_dev, r.xq_dev, r.xs_dev), fixed_array(bg, bq, bs), fixed_array(VT_CT_GATE, VT_XQ, VT_XQ))
+    }
+    return true
+}
+
+//! a tail GEMM's set over its tile - into the soft tokens (`to_out`) or the hidden rows - built once per tile key
+def private vt_ct_gemm_set(var r : VtResident; v : VtTile; to_out : bool; key : int) : VkDescriptorSet {
+    return cached(r.sets_front, key + vt_tile_key(v)) $() : VkDescriptorSet {
+        if (to_out) {
+            return vt_tile_set(r, v, r.ct_out_dev, r.ct_cap * r.ct_out * 4l, VT_TAIL_OUT)
+        }
+        return vt_tile_set(r, v, r.ct_hid_dev, r.ct_cap * r.ct_hid * 4l, VT_CT_HID)
+    }
+}
+
+//! the tail's planes and sets for this chain's scratch, its GEMM sets into the record; false = an allocation failed
+def private vt_ct_ready(var r : VtResident; var tl : VtChatTail) : bool {
+    let hid = tl.m2in > 0l ? tl.n1out : 0l
+    let gate = tl.kind == AudioProjKind.ultravox ? tl.m2in : 0l
+    if ((r.ct_cap != r.cap_rows || r.ct_hid != hid || r.ct_gate != gate || r.ct_out != tl.out) && !vt_ct_bufs(r, hid, gate, tl.out)) {
+        return false
+    }
+    tl.s_mm1 = vt_ct_gemm_set(r, tl.tile1, tl.m2in == 0l, VT_CT_MM1_KEY)
+    if (tl.m2in > 0l) {
+        tl.s_mm2 = vt_ct_gemm_set(r, tl.tile2, true, VT_CT_MM2_KEY)
+    }
+    return true
+}
+
+//! a GEMM feed off the tail's f32 rows: the arm's clamp + halfword store or clamp + requant over `nelem` elements
+def private vt_ct_feed(raw : VkCommandBuffer; var h : VkHaz; cm2 : bool; var s : VkDescriptorSet; nelem : int64) {
+    var pc_rq = RqArgs(inbase = 0u, nblk = uint(nelem / kq_elems(KqFmt.q8)), lo = -VT_NO_CLAMP, hi = VT_NO_CLAMP)
+    vt_feed_enc(raw, h, cm2, s, pc_rq, nelem)
+    vt_pt(raw, VtProfRole.rq)
+}
+
+//! the tail's dispatches after the last block, by projector kind: the pair pool and the post-norm (ultravox norms every position
+//! and rms-norms the stacked rows), the first GEMM off the feed, qwen2a's bias, the ultravox gate with its mid rms or voxtral's
+//! erf GELU, the second GEMM; record `map1` carries the first GEMM's map, the next the second's
 [arch(at = "../ARCHITECTURE_GPU_TOWER_VULKAN.md#vk-tower-encode-chains")]
-def private vt_aud_blocks(t : AudioTower; var s : EncoderState; npos : int64; ln_post : bool) : bool {
+def private vt_ct_enc(raw : VkCommandBuffer; var h : VkHaz; var r : VtResident; var tl : VtChatTail; d, map1 : int64; cm2 : bool) {
+    let uv = tl.kind == AudioProjKind.ultravox
+    let n1 = tl.pool_rows * d
+    var pc_ln = TowerLnArgs(d = uint(d), rows = uint(tl.pool_rows), eps = tl.eps, ln_on = 1u, lnoff = tl.lnoff, lnboff = tl.lnboff)
+    if (uv) {
+        enc_tower_ln_cls(raw, h, r.s_ln, pc_ln, tl.pool_rows)
+        vt_pt(raw, VtProfRole.ln)
+        var pc_rms = tower_rms_args(uint(tl.m1in), tl.normpre, VT_CT_RMS_EPS)
+        enc_hc_norm_cls(raw, h, r.s_ct_rms_xb, pc_rms, tl.rows)
+        vt_pt(raw, VtProfRole.rms)
+        vt_ct_feed(raw, h, cm2, r.s_ct_feed_xb, n1)
+    } else {
+        var pc_pool = GkPoolRowsArgs(width = uint(d), total = uint(n1))
+        enc_tower_pool_rows_cls(raw, h, r.s_ct_pool, pc_pool, (n1 + 255l) / 256l)
+        vt_pt(raw, VtProfRole.pool)
+        if (cm2) {
+            enc_tower_ln16_cls(raw, h, r.s_ct_ln16, pc_ln, tl.pool_rows)
+            vt_pt(raw, VtProfRole.ln)
+        } else {
+            enc_tower_ln_cls(raw, h, r.s_ct_ln, pc_ln, tl.pool_rows)
+            vt_pt(raw, VtProfRole.ln)
+            vt_ct_feed(raw, h, false, r.s_ct_feed_xb, n1)
+        }
+    }
+    var pc_g1 = BatchArgs(n = uint(tl.m1in), d = uint(tl.n1out), map_off = g_vt_maps[map1])
+    vt_tile_enc(raw, h, tl.tile1, tl.s_mm1, pc_g1, tl.g1)
+    vt_pt(raw, VtProfRole.gemm_o)
+    let nh = tl.rows * tl.n1out
+    if (tl.m2in == 0l) {
+        var pc_b = TowerBiasArgs(d = uint(tl.n1out), nelem = uint(nh), boff = tl.proj_b, act = BIAS_ACT_NONE)
+        enc_tower_bias_act_cls(raw, h, r.s_ct_bias_out, pc_b, rq_wgs(false, nh))
+        vt_pt(raw, VtProfRole.bias)
+        return
+    }
+    let n2 = tl.rows * tl.m2in
+    if (uv) {
+        var pc_gate = GkGatedRowsArgs(d = uint(tl.m2in), nelem = uint(n2))
+        enc_tower_swiglu_swapped_cls(raw, h, r.s_ct_swiglu, pc_gate, (n2 + 255l) / 256l)
+        vt_pt(raw, VtProfRole.glu)
+        var pc_rms = tower_rms_args(uint(tl.m2in), tl.normmid, VT_CT_RMS_EPS)
+        enc_hc_norm_cls(raw, h, r.s_ct_rms_gate, pc_rms, tl.rows)
+        vt_pt(raw, VtProfRole.rms)
+        vt_ct_feed(raw, h, cm2, r.s_ct_feed_gate, n2)
+    } else {
+        var pc_act = TowerBiasArgs(d = uint(tl.n1out), nelem = uint(nh), boff = 0u, act = BIAS_ACT_GELU_ERF)
+        enc_tower_act_cls(raw, h, r.s_ct_gelu, pc_act, rq_wgs(false, nh))
+        vt_pt(raw, VtProfRole.bias)
+        vt_ct_feed(raw, h, cm2, r.s_ct_feed_hid, n2)
+    }
+    var pc_g2 = BatchArgs(n = uint(tl.m2in), d = uint(tl.out), map_off = g_vt_maps[map1 + 1l])
+    vt_tile_enc(raw, h, tl.tile2, tl.s_mm2, pc_g2, tl.g2)
+    vt_pt(raw, VtProfRole.gemm_o)
+}
+
+[arch(at = "../ARCHITECTURE_GPU_TOWER_VULKAN.md#vk-tower-encode-chains")]
+def private vt_aud_blocks(t : AudioTower; var s : EncoderState; npos : int64; ln_post : bool; var ct : VtChatTail = VtChatTail()) : bool {
     var r & = g_vt_aud
     g_vt_aud_out_bytes = 0l
     if (!g_vt_env_tower) {
@@ -2255,7 +2567,25 @@ def private vt_aud_blocks(t : AudioTower; var s : EncoderState; npos : int64; ln
     if (ln_post) {
         return vt_ln_chain(r, g_vt_ln_offs, t.has_k_bias, act, t.eps, t.layers_off, d, ff, hs, hsp, t.n_head, npos, khr, v, vff, s.x, t.lnp_w_off, t.lnp_b_off, s.xb)
     }
+    if (ct.on) {
+        ensure_length(s.out, ct.rows * ct.out)
+        return vt_ln_chain(r, g_vt_ln_offs, t.has_k_bias, act, t.eps, t.layers_off, d, ff, hs, hsp, t.n_head, npos, khr, v, vff, s.x, -1l, -1l, g_vt_no_rows, ct, s.out)
+    }
     return vt_ln_chain(r, g_vt_ln_offs, t.has_k_bias, act, t.eps, t.layers_off, d, ff, hs, hsp, t.n_head, npos, khr, v, vff, s.x)
+}
+
+//! the blocks with the projector tail behind them where the tail lever is on and the tail's shape rides the chain
+//! (`vt_ct_shape_ok`), else the blocks alone; which it served, so the CPU tail runs exactly when the device one did not
+[hot_path]
+def private vulkan_audio_tower_blocks_tail(t : AudioTower; var s : EncoderState; npos : int64) : TowerTailServed {
+    var ct = VtChatTail()
+    if (g_vt_env_tail && t.q8 && vt_ct_shape_ok(t, npos)) {
+        ct = vt_ct_prepare(t, npos, vt_cm2_feed())
+    }
+    if (!vt_aud_blocks(t, s, npos, false, ct)) {
+        return TowerTailServed.declined
+    }
+    return ct.on ? TowerTailServed.tail : TowerTailServed.blocks
 }
 
 [hot_path]
@@ -2281,7 +2611,9 @@ def private vt_aud_attach(var r : VtResident; t : AudioTower) : bool {
     if (r.key == key) {
         return true
     }
-    return vt_upload_ln(r, key, t.qblob, t.qscales, t.d_model, t.n_ff, t.fblob, t.layers_off, rows_n, lay, g_vt_ln_offs, vt_aud_has_conv(t) ? t.conv2_w_off : -1l)
+    var proj : array<VtRegion>
+    vt_ct_regions(t, proj)
+    return vt_upload_ln(r, key, t.qblob, t.qscales, t.d_model, t.n_ff, t.fblob, t.layers_off, rows_n, lay, g_vt_ln_offs, vt_aud_has_conv(t) ? t.conv2_w_off : -1l, proj)
 }
 
 let private VT_STEM_MEL = 0x1000000u   //! the whisper-class stem's hazard bits: the mel block, conv1's im2col and its rows
@@ -2396,7 +2728,7 @@ def private vulkan_audio_conv_front(t : AudioTower; var s : EncoderState; mel : 
     }
     let g_d = cm2_tiles_at(d, tt, tc_d)
     let g_ff = cm2_tiles_at(ff, tt, tc_ff)
-    if (!vt_ln_scratch(r, t.n_layer, tt, d, ff, hs, d, g_d, g_ff, khr, true, tc_d, tc_ff, v, vff)) {
+    if (!vt_ln_scratch(r, t.n_layer, tt, d, ff, hs, d, g_d, g_ff, khr, true, tc_d, tc_ff, v, vff, 0l)) {
         return vt_decline(r, VulkanTowerDecline.memory)
     }
     if (r.front_cap != tin || r.gemm_khr != arm.gemm_khr) {
@@ -3747,6 +4079,7 @@ def dasllama_vulkan_tower_register {
         register_qwen25v_gpu_blocks(@@vulkan_qwen25v_blocks)
         register_tower_blocks_gpu(@@vulkan_audio_tower_blocks, @@vulkan_tower_serves_exact)
         register_tower_blocks_ln_post_gpu(@@vulkan_audio_tower_blocks_ln_post)
+        register_tower_blocks_tail_gpu(@@vulkan_audio_tower_blocks_tail)
         register_tower_conv_gpu(@@vulkan_audio_conv_front)
         register_gemma4a_gpu(@@vulkan_gemma4a_blocks, @@vulkan_tower_serves_exact)
         register_canary_gpu(@@vulkan_canary_blocks, @@vulkan_tower_serves_exact)

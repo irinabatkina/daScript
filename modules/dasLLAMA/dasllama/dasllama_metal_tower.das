@@ -418,7 +418,7 @@ def private tw_tail_body(enc : MetalComputeEncoder?; t : AudioTower; tl : TwTail
         return
     }
     let tp = npos / 2l   // the pair pool BEFORE the post-norm
-    enc_tw_pool2(enc, bx, bs, TwRowsArgs(width = uint(d), total = uint(tp * d)), tp * d)
+    enc_tw_pool2(enc, bx, bs, GkPoolRowsArgs(width = uint(d), total = uint(tp * d)), tp * d)
     enc_ln(enc, bs, bblob, uint64(t.lnp_w_off * 4l), bblob, uint64(t.lnp_b_off * 4l), tl.bin, 0ul, u_d, u_eps, tp)
     if (t.proj_kind == AudioProjKind.qwen2a) {
         enc_f32_mm(enc, bblob, uint64(t.proj_w_off * 4l), tl.bin, tl.bout, 0ul, tl.u_in, tl.u_proj, tl.mpr, t.proj_dim)

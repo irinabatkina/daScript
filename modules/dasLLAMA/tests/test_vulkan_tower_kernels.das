@@ -550,6 +550,61 @@ def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over t
     }
 }
 
+//! the chat projector tails' row classes on the templates both homes stamp: the pair pool against the mean of each row pair, the
+//! swapped gate against the CPU `swiglu_swapped_rows` - the fixture's halves differ, so the gate with its halves swapped misses on
+//! most elements - at a width off every workgroup multiple
+[test]
+def test_vkt_tower_tail_rows(t0 : T?) {
+    t0 |> run("the pair pool and the swapped SwiGLU rows == the CPU forms") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!vk_moe_init() || !ensure_tower_pool_rows_cls() || !ensure_tower_swiglu_swapped_cls()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            let width = 70
+            let rows = 5
+            let total = rows * width
+            let x <- row_fill(2 * total, 37, 5, 0.043, 2.1)
+            with_cell_planes() $(var cp : CellPlanes) {
+                let xp = cp |> in_(x)
+                let pp = cp |> out_(total)
+                let gp = cp |> out_(total)
+                var s_pool = cp |> cls_set(fixed_array(xp, pp), @@set_tower_pool_rows_cls)
+                var s_gate = cp |> cls_set(fixed_array(xp, gp), @@set_tower_swiglu_swapped_cls)
+                var pa_pool = GkPoolRowsArgs(width = uint(width), total = uint(total))
+                var pa_gate = GkGatedRowsArgs(d = uint(width), nelem = uint(total))
+                cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
+                    enc_tower_pool_rows_cls(raw, h, s_pool, pa_pool, int64((total + 255) / 256))
+                    enc_tower_swiglu_swapped_cls(raw, h, s_gate, pa_gate, int64((total + 255) / 256))
+                }
+                let p_dev <- cp |> plane_run(pp)
+                let g_dev <- cp |> plane_run(gp)
+                var p_ref : array<float>
+                p_ref |> resize(total)
+                for (i in range(total)) {
+                    let at = (i / width) * 2 * width + i % width
+                    p_ref[i] = 0.5 * (x[at] + x[at + width])
+                }
+                check_rows(t, "tower_pool_rows the mean of each row pair", p_dev, p_ref, BAR_APPROX, width)
+                var g_ref : array<float>
+                g_ref |> resize(total)
+                swiglu_swapped_rows(g_ref, x, int64(width), int64(rows))
+                check_rows(t, "tower_swiglu_swapped silu(second half) . first half vs swiglu_swapped_rows", g_dev, g_ref, BAR_APPROX, width)
+                var swapped : array<float>
+                swapped |> resize(total)
+                for (i in range(total)) {
+                    let at = (i / width) * 2 * width + i % width
+                    swapped[i] = silu_f32(x[at]) * x[at + width]
+                }
+                let moved = mismatch_approx(g_dev, swapped)
+                t |> success(moved > total / 2, "tower_swiglu_swapped control: the gate with its halves swapped lands elsewhere ({moved} of {total} moved)")
+            }
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
 let private G4A_PAST = int(gemma4a_attn_past())   //! the RPE table carries past + 1 rows
 let private G4A_CAP = gemma4a_softcap()
 

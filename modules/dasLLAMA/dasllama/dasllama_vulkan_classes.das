@@ -9744,6 +9744,26 @@ class TowerGluSig : GkGatedRows {
     }
 }
 
+//! the ultravox projector's gate, silu(second half) . first half, on the same template at FORM 1
+[vk_dispatch(name = "tower_swiglu_swapped_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
+class TowerSwigluSwapped : GkGatedRows {
+    override FORM = 1
+
+    [spirv_kernel(local_size_x = 256, name = "tower_swiglu_swapped_cls_spv")]
+    def run {
+        gated_rows_body()
+    }
+}
+
+//! the chat projector tails' pair pool ahead of the post-norm (qwen2a, voxtral), on the template both homes stamp
+[vk_dispatch(name = "tower_pool_rows_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
+class TowerPoolRows : GkPoolRows {
+    [spirv_kernel(local_size_x = 256, name = "tower_pool_rows_cls_spv")]
+    def run {
+        pool_rows_body()
+    }
+}
+
 //! gemma4a's causal depthwise conv, k = 5: the chunk's first rows read nothing before the start
 [vk_dispatch(name = "tower_dw_conv5_cls", kernel = "run", grid = "wgs", params = "wgs : int64")]
 class TowerDwConv5 : GkDwConvRows {

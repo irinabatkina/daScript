@@ -726,7 +726,9 @@ GLU, the causal depthwise taps, the chunk-12 relative-position attention on both
 the 128-wide one over scaled queries with the oracle at four times the cap as the softcap's
 control) and the FastConformer conv module tail (`test_vkt_tower_fastconformer`: the centered
 depthwise conv with the folded BatchNorm and silu) against the CPU loops' forms, the attention
-controls scaling the keys (a uniform shift leaves a softmax alone). Every compare in the file
+controls scaling the keys (a uniform shift leaves a softmax alone); and the chat projector tails' row
+classes (`test_vkt_tower_tail_rows`: the pair pool against the mean of each row pair, the swapped SwiGLU
+against `swiglu_swapped_rows` with the halves-swapped form as the control). Every compare in the file
 carries its own poisoned-element control - a value added to the expected element that must red
 the bar - and every float compare runs through `check_rows`, which logs its measured max difference;
 the attention oracles share `_attn_oracle.das`'s softmax row, `attn_row_scored`, each spelling only
@@ -1814,10 +1816,14 @@ on the device on both, another mel's rows outside the bar as the control (reads 
 the chat towers' chunked mel on the device mel seat - a 128-mel clip's chunk within 1e-3 of the
 CPU mel (the seat's GEMMs on the exact f32 tiles: a half tile reads a quiet bin 0.085 off), the mel
 counter (`metal_tower_mel_encodes`) up by the device leg alone, an 80-mel call off the seat's
-lattice served by the CPU with the counter unmoved, another clip's mel outside the bar; and the Vulkan twins
+lattice served by the CPU with the counter unmoved, another clip's mel outside the bar; the Vulkan twins
 `test_encoder_blocks_vulkan`, `test_gemma4a_vulkan_twin`, `test_canary_vulkan_twin` and
-`test_qwen3a_vulkan_front` (the three-way cells described under `test_vulkan_tower_kernels.das`),
-which skip without their carriers (the qwen2audio / voxtral / omni-3b f32 mmprojs, the E2B bf16
+`test_qwen3a_vulkan_front` (the three-way cells described under `test_vulkan_tower_kernels.das`); and
+`test_encoder_tail_vulkan`, the projector tail alone on the Vulkan chain, one cell a projector kind on the
+q8 tower minted in memory (the device tail against the CPU tail over the SAME device block rows,
+`set_vulkan_tower_tail` off for the CPU-tail leg and put back, within 1e-2 rel-l2, the tail counter
+`vulkan_tower_tail_encodes` up on the device leg alone with the blocks on the device on both, another mel's
+rows outside the bar as the control), all of which skip without their carriers (the qwen2audio / voxtral / omni-3b f32 mmprojs, the E2B bf16
 mmproj, the canary f32 encoder, the Qwen3-ASR bf16 mmproj), without jfk.wav, without a Vulkan
 device under `DASLLAMA_GPU=1`, and on a das_metal build.
 `test_whisper.das` - stocked suite; model-gated: the whisper/parakeet/canary/gemma4a/omni

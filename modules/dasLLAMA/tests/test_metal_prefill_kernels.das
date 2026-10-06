@@ -1178,7 +1178,7 @@ def private tw_tail_rows_gate(t : T?; var dev, queue) {
             apart += abs(a - b) > 1e-3 ? 1 : 0
         }
         t |> success(apart > total / 2, "tw_swiglu_rows: the fixture tells the halves apart ({apart} of {total})")
-        var ka = TwRowsArgs(width = uint(width), total = uint(total))
+        var ka = GkPoolRowsArgs(width = uint(width), total = uint(total))
         var kg_args = GkGatedRowsArgs(d = uint(width), nelem = uint(total))
         let bx = mc |> in_(x)
         let bp = mc |> out_(total)

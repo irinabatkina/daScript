@@ -4118,26 +4118,12 @@ class MetalG4aLogMel {
     }
 }
 
-struct TwRowsArgs {
-    width : uint    //!< the OUTPUT row's width
-    total : uint    //!< output elements
-}
-
-//! The whisper-class projector tails' pair pool: y [rows x width] the mean of x's row pairs [2 rows x width].
+//! The whisper-class projector tails' pair pool, on the template both homes stamp.
 [metal_dispatch(name = "enc_tw_pool2", pso = "g_pf_pso_tw_pool2", tg = 64, grid = "total/64", params = "total : int64")]
-class MetalTwPool2 {
-    @ssbo @binding = 0 @role = "read" x : array<float>
-    @ssbo @binding = 1 @role = "write" y : array<float>
-    @uniform @binding = 2 ka : TwRowsArgs
-
+class MetalTwPool2 : GkPoolRows {
     [metal_kernel(name="metal_tw_pool2_msl")]
     def metal_tw_pool2 {
-        let gid = gl_GlobalInvocationID.x
-        if (gid >= ka.total) {
-            return
-        }
-        let at = (gid / ka.width) * 2u * ka.width + gid % ka.width
-        y[gid] = 0.5 * (x[at] + x[at + ka.width])
+        pool_rows_body()
     }
 }
 

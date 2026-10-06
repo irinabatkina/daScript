@@ -790,6 +790,79 @@ def test_encoder_tail_gpu(tst : T?) {
     }
 }
 
+//! The projector tail on the Vulkan chain against the CPU tail over the SAME device block rows (the tail lever off), one cell a
+//! projector kind on the q8 tower minted in memory: the soft tokens within `bar` rel-l2, the tail counter up by the device leg
+//! alone with the blocks served on both, and the rows of another mel outside the bar (the control).
+def private vulkan_tail_cell(t : T?; file : string; kind : AudioProjKind; bar : float) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let path = path_join(models_dir(), file)
+        if (!model_available(t, path) || !vulkan_twin_seat(t)) {
+            return
+        }
+        let tag = "{file} vulkan tail"
+        var tw <- mint_aud(path, true, -1l)
+        t |> success(tw.q8 && tw.proj_kind == kind, "{tag}: the q8 tower of the projector kind the cell names")
+        var mel = MelChunk(n_mel = tw.n_mel, n_len = AUDIO_CHUNK_FRAMES)
+        mel.data |> resize(tw.n_mel * AUDIO_CHUNK_FRAMES)
+        for (i in range(length(mel.data))) {
+            mel.data[i] = sin(float(i) * 0.0137) * 0.8 + sin(float(i) * 0.00291) * 0.5
+        }
+        var enc <- make_encoder_state(tw)
+        let n = audio_tokens_per_chunk(tw) * tw.proj_dim
+        let tail_was = vulkan_tower_tail_knob()
+        defer() {
+            set_vulkan_tower_tail(tail_was)
+        }
+        with_gpu_knobs() {
+            set_vulkan_tower(true)
+            set_vulkan_audio_blocks(true)
+            with_dasllama_jobque_() {
+                set_vulkan_tower_tail(false)
+                let e0 = vulkan_tower_stats().encodes
+                let t0 = vulkan_tower_tail_encodes()
+                audio_encode(tw, enc, mel)
+                var inscope cpu_tail <- copy_span(enc.out, 0l, n)
+                t |> equal(vulkan_tower_stats().encodes - e0, 1l, "{tag}: lever off: the blocks still ride the device")
+                t |> equal(vulkan_tower_tail_encodes() - t0, 0l, "{tag}: lever off: the tail stays on the CPU")
+                set_vulkan_tower_tail(true)
+                audio_encode(tw, enc, mel)
+                var inscope dev_tail <- copy_span(enc.out, 0l, n)
+                t |> equal(vulkan_tower_stats().encodes - e0, 2l, "{tag}: lever on: the blocks ride the device")
+                t |> equal(vulkan_tower_tail_encodes() - t0, 1l, "{tag}: lever on: the tail rides the device behind the blocks")
+                for (i in range(length(mel.data))) {
+                    mel.data[i] = sin(float(i) * 0.0091) * 0.8 + sin(float(i) * 0.00417) * 0.5
+                }
+                audio_encode(tw, enc, mel)
+                var inscope other <- copy_span(enc.out, 0l, n)
+                var got = TowerParityStats()
+                var ctl = TowerParityStats()
+                if (tower_parity_stats(t, tag, cpu_tail, dev_tail, got) && tower_parity_stats(t, "{tag} control", cpu_tail, other, ctl)) {
+                    t |> success(got.rel_l2 <= double(bar), "{tag}: device tail vs CPU tail rel_l2 {got.rel_l2} (bar {bar})")
+                    t |> success(ctl.rel_l2 > double(bar), "{tag}: another mel's rows land outside the bar (rel_l2 {ctl.rel_l2}) - the control")
+                }
+            }
+        }
+        delete enc
+        delete tw
+        vulkan_tower_shutdown()
+    } else {
+        t |> skip("dasVulkan not present")
+    }
+}
+
+[test]
+def test_encoder_tail_vulkan(tst : T?) {
+    tst |> run("the qwen2a tail on the Vulkan chain: pair pool, post-norm, one biased linear") @(t : T?) {
+        vulkan_tail_cell(t, "mmproj-omni-3b-f32.gguf", AudioProjKind.qwen2a, 1e-2)
+    }
+    tst |> run("the ultravox tail on the Vulkan chain: post-norm, stacked rms, gated MLP") @(t : T?) {
+        vulkan_tail_cell(t, "mmproj-ultravox-v0_5-llama-3_2-1b-f16.gguf", AudioProjKind.ultravox, 1e-2)
+    }
+    tst |> run("the voxtral tail on the Vulkan chain: pair pool, post-norm, stacked GELU MLP") @(t : T?) {
+        vulkan_tail_cell(t, "voxtral-mini-mmproj-f32.gguf", AudioProjKind.voxtral, 1e-2)
+    }
+}
+
 [test]
 def test_omni_tower(t : T?) {
     t |> run("qwen2.5o mmproj: audio side is qwen2a verbatim, vision tensors skipped") @(t : T?) {

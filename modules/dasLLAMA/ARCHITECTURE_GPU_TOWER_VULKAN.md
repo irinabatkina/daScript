@@ -62,7 +62,7 @@ from the CPU-windowed frames (`canary_window_frames`, gemma4a's and qwen3a's win
 one host phase every audio chain keeps) and runs the spectrum, the mel, the subsample convs and the
 input projection in one command buffer, so the blocks chain reads the residual rows the front wrote
 and the tail (the projector, the post-norm) stays on the CPU except where a bullet below says
-the chain runs it (gemma4a's projector tail). Where a chain and its family part on the seat:
+the chain runs it (the projector tails of gemma4a and of the chat towers). Where a chain and its family part on the seat:
 
 - **gemma4v** serves the hook after the CPU stem, whole. **gemma3v**'s hook fires before the CPU
   stem (the Metal driver runs the stem itself), so `gemma3v_encode` finishes the stem on the CPU
@@ -87,42 +87,42 @@ the chain runs it (gemma4a's projector tail). Where a chain and its family part 
   mul_mm arm keeps the f32 rows and a requant before every GEMM. The fc2 GEMM - the chain's one
   K past 2048 - takes the prefill's split-k pick (`cm2_gemm_pick` over the ff-deep K against the
   resident's partial planes, `SplitKReduce` summing them into the fc2 rows) where the wave model
-  favours it and the encode carries `VT_SK_MIN_ROWS` = 512 rows or more (the window the model's
-  units were measured at; `DASLLAMA_CM2_SPLITK` overrides the chunk count, `0` the pick, and
-  `vt_sk_build` logs the split once per model): 60 tiles of the 1280-wide whisper rows fill a 36-SM card whole and leave a quarter of an
-  82-SM card idle, while a 128-row window's seven tiles pay the reduce for nothing. The conv stem
-  (`register_tower_conv_gpu`)
-  serves on the same resident where the GEMMs ride the cm2 feed: conv1 as a k3 im2col to f16 and
-  the f16 GEMM over an f16 slab of the file's f32 weights (3 n_mel padded to 64), conv2 as an
-  im2col into the chain's f16 feed and the q8 tile over the plane the upload gathers beside the
-  block records, the biases, GELU and position rows off a plane of the stem's own; the residual
-  rows read back into the state and left in the chain's x buffer, which the block loop reads
-  without its upload (`x_ready`). The mel and the projector stay on the CPU, and the mul_mm arm
-  keeps the CPU stem. Qwen3-ASR's front takes its own two seats: the mel hook runs the
-  frames' power spectrum and the mel-major log rows (the global clamp stays with the caller), and
-  the front hook runs the window's chunk convs (im2col to f16 and the f16 GEMM a stage, the
-  bias + activation as a row class), the feature shuffle, `conv_out` on the cm2 q8 tile and the
-  bias + positions, read back into the state the block loop then serves - so a second window on
-  the same residency recomputes every stage's offsets from its own chunk count. A position plane
-  adds through the bias class as one bias row as wide as the rows it covers (the class repeats its
-  bias row every `d` elements): the whisper stem's row is its whole plane, so each position row
-  lands once, and qwen3a's is one chunk's 13 position rows, so every chunk takes them - qwen3a's
-  finish is two bias passes, the `conv_out` bias row, then those positions.
-- **gemma4a** serves the whole chunk (`vulkan_gemma4a_chunk`: the DFT with the magnitude arm and a
-  frame-major store, the mel, both subsample convs as im2col + the f16 GEMM + a LayerNorm-ReLU row
-  class, the input projection on the cm2 q8 tile) and hands the residual rows to its blocks chain,
-  which ends in the projector tail the CPU `g4a_projector_tail` spells - the out-proj with its bias,
-  the weightless rms off the norms plane's ones row, the mm-proj - and reads the projected rows
-  back into the state's `out` with `out_ready` raised, so the family's CPU tail stands down on
-  both routes (the chunk's and the blocks-only one): the macaron halves as the
-  post-add class with a half residual weight, the clamped GEMM sites as the arm's feed (the
-  clamp + halfword store on the cm2 feed, the clamp-requant on the mul_mm tiles), the tile and the
-  output clamp where the site's calibration record is live (`vt_mm_clamped`, the device twin of
-  the CPU's `g4a_mm_clamped`; canary's chain rides it with no clamp record, as its CPU `cn_mm_rq`
-  has none), the chunk-12 relative-position attention in its own class with the
-  query's per-dim scale and the key scale folded in, the conv module's GLU and causal depthwise
-  taps as row classes. The RPE table rides the resident's rel quartet and its projection is a
-  13-row batch GEMM on its own set.
+  favours it and the encode carries `VT_SK_MIN_ROWS` = 512 rows or more (`DASLLAMA_CM2_SPLITK` overrides the
+  chunk count, `0` the pick; `vt_sk_build` logs it once per model): 60 tiles of whisper's 1280-wide rows fill a
+  36-SM card, a 128-row window's seven pay the reduce for nothing. The conv stem (`register_tower_conv_gpu`)
+  serves on the same resident where the GEMMs ride the cm2 feed: conv1 as a k3 im2col to f16 and the f16 GEMM
+  over an f16 slab of the file's f32 weights (3 n_mel padded to 64), conv2 as an im2col into the chain's f16
+  feed and the q8 tile over the plane the upload gathers beside the block records, the biases, GELU and
+  position rows off a plane of the stem's own; the residual rows read back into the state and left in the
+  chain's x buffer, which the block loop reads without its upload (`x_ready`). The mel stays on the CPU, and
+  the mul_mm arm keeps the CPU stem. The chat projector tail rides the chain behind the last block
+  (`register_tower_blocks_tail_gpu`, `vt_ct_enc`): the CPU `audio_encode` tail's steps at its widths - the pair
+  pool and the post-norm (ultravox norms every position, then rms-norms the stacked rows), the projector GEMMs
+  off the arm's feed over the q8 projector planes uploaded beside the block records, qwen2a's bias, the swapped
+  gate with its mid rms or voxtral's erf GELU - and reads the soft tokens back in the blocks' rows' place; it
+  serves where the GEMMs sit on the tiles' lattice (`vt_ct_shape_ok`), else the blocks alone, answering which
+  (`TowerTailServed`; lever `set_vulkan_tower_tail`, counter `vulkan_tower_tail_encodes`).
+  Qwen3-ASR's front takes its own two seats: the mel hook runs the frames' power spectrum and the mel-major log rows
+  (the global clamp stays with the caller), and the front hook runs the window's chunk convs (im2col to f16 and the
+  f16 GEMM a stage, the bias + activation as a row class), the feature shuffle, `conv_out` on the cm2 q8 tile and
+  the bias + positions, read back into the state the block loop then serves - so a second window on the same
+  residency recomputes every stage's offsets from its own chunk count. A position plane adds through the bias class
+  as one bias row as wide as the rows it covers (the class repeats its bias row every `d` elements): the whisper
+  stem's row is its whole plane, so each position row lands once, and qwen3a's is one chunk's 13 position rows, so
+  every chunk takes them - qwen3a's finish is two bias passes, the `conv_out` bias row, then those positions.
+- **gemma4a** serves the whole chunk (`vulkan_gemma4a_chunk`: the DFT with the magnitude arm and a frame-major
+  store, the mel, both subsample convs as im2col + the f16 GEMM + a LayerNorm-ReLU row class, the input
+  projection on the cm2 q8 tile) and hands the residual rows to its blocks chain, which ends in the projector
+  tail the CPU `g4a_projector_tail` spells - the out-proj with its bias, the weightless rms off the norms
+  plane's ones row, the mm-proj - and reads the projected rows back into the state's `out` with `out_ready`
+  raised, so the family's CPU tail stands down on both routes (the chunk's and the blocks-only one): the
+  macaron halves as the post-add class with a half residual weight, the clamped GEMM sites as the arm's feed
+  (the clamp + halfword store on the cm2 feed, the clamp-requant on the mul_mm tiles), the tile and the output
+  clamp where the site's calibration record is live (`vt_mm_clamped`, the device twin of the CPU's
+  `g4a_mm_clamped`; canary's chain rides it with no clamp record, as its CPU `cn_mm_rq` has none), the chunk-12
+  relative-position attention in its own class with the query's per-dim scale and the key scale folded in, the
+  conv module's GLU and causal depthwise taps as row classes. The RPE table rides the resident's rel quartet
+  and its projection is a 13-row batch GEMM on its own set.
 - **canary** serves the blocks seat with the whisper-class row classes (layernorm, the bias
   class with a silu mode, the layernorm seam with the half residual weight) plus two of its own:
   the full bidirectional Transformer-XL attention with the u/v biases and an online softmax, and
